@@ -396,6 +396,29 @@ describe('user routes', () => {
     });
   });
 
+  describe('PATCH /users/:id (admin update)', () => {
+    it('rejects unknown top-level fields including roleId (strict schema)', async () => {
+      // The Edit dialog historically sent { email, name, roleId } and roleId was
+      // silently dropped because updateUserSchema lacked .strict(). After the
+      // hardening, the extra field must surface as 400 instead of a no-op 200.
+      const res = await app.request('/users/11111111-1111-1111-1111-111111111111', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'New Name', roleId: '22222222-2222-2222-2222-222222222222' })
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects an arbitrary extra field (strict schema, defense in depth)', async () => {
+      const res = await app.request('/users/11111111-1111-1111-1111-111111111111', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'New Name', mysteryField: 'oops' })
+      });
+      expect(res.status).toBe(400);
+    });
+  });
+
   describe('POST /users/:id/role', () => {
     it('should assign a partner role', async () => {
       vi.mocked(db.select)

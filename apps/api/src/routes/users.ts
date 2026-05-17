@@ -70,10 +70,12 @@ const resendInviteSchema = z.object({
   userId: z.string().uuid()
 });
 
+// .strict() so unknown keys surface as 400, not silently dropped. Role is not
+// updatable via this endpoint — POST /users/:id/role writes the join-table row.
 const updateUserSchema = z.object({
   name: z.string().min(1).max(255).optional(),
   status: z.enum(['active', 'invited', 'disabled']).optional()
-});
+}).strict();
 
 const assignRoleSchema = z.object({
   roleId: z.string().uuid()
