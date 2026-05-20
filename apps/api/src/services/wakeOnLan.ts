@@ -248,6 +248,10 @@ interface DispatchWakeOptions {
   ipAddress?: string;
   /** User-Agent of the request (for the audit row). */
   userAgent?: string;
+  /** Correlation id when invoked from a bulk endpoint. Stamped onto the audit row's
+   *  details so ops can group N per-device wake audit entries to a single bulk click.
+   *  Undefined for single-device wake (audit row carries no bulkId field). */
+  bulkId?: string;
 }
 
 export async function dispatchWake(
@@ -365,6 +369,7 @@ export async function dispatchWake(
       maskSource: subnet.maskSource,
       macs,
       relayOverride: Boolean(options.relayDeviceIdOverride),
+      ...(options.bulkId ? { bulkId: options.bulkId } : {}),
     },
     ipAddress: options.ipAddress,
     userAgent: options.userAgent,

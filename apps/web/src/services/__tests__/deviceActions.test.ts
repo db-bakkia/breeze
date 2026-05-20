@@ -5,11 +5,14 @@ import {
   decommissionDevice,
   executeScript,
   sendBulkCommand,
+  sendBulkWakeCommand,
   sendDeviceCommand,
   sendWakeCommand,
+  summarizeBulkWakeFailures,
   toggleMaintenanceMode,
   WakeCommandError,
-  wakeFriendlyErrorMessage
+  wakeFriendlyErrorMessage,
+  type BulkWakeFailed
 } from '../deviceActions';
 
 vi.mock('@/stores/auth', () => ({
@@ -320,6 +323,94 @@ describe('deviceActions service', () => {
 
       expect(result).toEqual({ succeeded: 2, failed: 1 });
       expect(fetchWithAuthMock).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('sendBulkWakeCommand', () => {
+    it('posts a single bulk request with deviceIds + type=wake', async () => {
+      fetchWithAuthMock.mockResolvedValueOnce(
+        makeResponse({
+          bulkId: 'bulk-abc',
+          succeeded: [
+            { deviceId: 'd1', commandId: 'c1', wakeAttemptId: 'w1', relayDeviceId: 'r1', relayHostname: 'r1h', broadcast: '10.0.0.255' },
+          ],
+          failed: [],
+        }, true, 202),
+      );
+
+      const result = await sendBulkWakeCommand(['d1']);
+
+      expect(fetchWithAuthMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchWithAuthMock.mock.calls[0]!;
+      expect(url).toBe('/devices/bulk/commands');
+      expect((init as RequestInit).method).toBe('POST');
+      expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+        deviceIds: ['d1'],
+        type: 'wake',
+      });
+      expect(result.bulkId).toBe('bulk-abc');
+      expect(result.succeeded).toHaveLength(1);
+      expect(result.failed).toHaveLength(0);
+    });
+
+    it('returns parsed succeeded + failed lists with original failure codes preserved', async () => {
+      fetchWithAuthMock.mockResolvedValueOnce(
+        makeResponse({
+          bulkId: 'bulk-xyz',
+          succeeded: [
+            { deviceId: 'a', commandId: 'c-a', wakeAttemptId: 'w-a', relayDeviceId: 'r1', relayHostname: 'r1h', broadcast: '10.0.0.255' },
+          ],
+          failed: [
+            { deviceId: 'b', code: 'NO_RELAY', message: 'No online peer.' },
+            { deviceId: 'c', code: 'NO_MACS', message: 'No MAC on file.' },
+            { deviceId: 'd', code: 'DECOMMISSIONED', message: 'Cannot wake a decommissioned device.' },
+          ],
+        }, true, 202),
+      );
+
+      const result = await sendBulkWakeCommand(['a', 'b', 'c', 'd']);
+
+      expect(result.succeeded.map(s => s.deviceId)).toEqual(['a']);
+      expect(result.failed.map(f => f.code)).toEqual(['NO_RELAY', 'NO_MACS', 'DECOMMISSIONED']);
+    });
+
+    it('throws on non-OK response so the caller surfaces one error toast', async () => {
+      fetchWithAuthMock.mockResolvedValueOnce(
+        makeResponse({ error: 'deviceIds exceeds max of 500' }, false, 400),
+      );
+      await expect(sendBulkWakeCommand(Array.from({ length: 501 }, (_, i) => `d${i}`))).rejects.toThrow(
+        /deviceIds exceeds max of 500/,
+      );
+    });
+  });
+
+  describe('summarizeBulkWakeFailures', () => {
+    it('returns empty string when nothing failed', () => {
+      expect(summarizeBulkWakeFailures([])).toBe('');
+    });
+
+    it('groups failures by code with human-readable phrasing', () => {
+      const failed: BulkWakeFailed[] = [
+        { deviceId: '1', code: 'NO_RELAY', message: '' },
+        { deviceId: '2', code: 'NO_RELAY', message: '' },
+        { deviceId: '3', code: 'NO_RELAY', message: '' },
+        { deviceId: '4', code: 'NO_MACS', message: '' },
+        { deviceId: '5', code: 'DECOMMISSIONED', message: '' },
+      ];
+      const out = summarizeBulkWakeFailures(failed);
+      expect(out).toMatch(/3 with no online peer at their site/);
+      expect(out).toMatch(/1 with no MAC on file/);
+      expect(out).toMatch(/1 decommissioned/);
+    });
+
+    it('collapses IPv6_ONLY and NO_SUBNET into one bucket', () => {
+      const failed: BulkWakeFailed[] = [
+        { deviceId: '1', code: 'NO_SUBNET', message: '' },
+        { deviceId: '2', code: 'IPV6_ONLY', message: '' },
+      ];
+      const out = summarizeBulkWakeFailures(failed);
+      // Both map to the same label "with no usable IPv4 history" → one bucket of 2
+      expect(out).toBe('2 with no usable IPv4 history');
     });
   });
 });

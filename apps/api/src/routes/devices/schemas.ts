@@ -48,9 +48,18 @@ export const createCommandSchema = z.object({
   payload: z.any().optional()
 });
 
+/**
+ * Per-request cap on bulk command operations. 500 keeps the worst-case
+ * wall time well under Cloudflare's ~100s proxy timeout (HTTP 524) even
+ * if a future bulk type ends up serial — at the inline 8-worker pool
+ * used by the bulk-wake path, 500 devices completes in single-digit
+ * seconds. Caps DoS risk from an auth'd caller passing a giant array.
+ */
+export const BULK_COMMAND_MAX_DEVICES = 500;
+
 export const bulkCommandSchema = z.object({
-  deviceIds: z.array(z.string().uuid()).min(1),
-  type: z.enum(['script', 'reboot', 'reboot_safe_mode', 'shutdown', 'update', 'collect_evidence', 'execute_containment']),
+  deviceIds: z.array(z.string().uuid()).min(1).max(BULK_COMMAND_MAX_DEVICES),
+  type: z.enum(['script', 'reboot', 'reboot_safe_mode', 'shutdown', 'update', 'collect_evidence', 'execute_containment', 'wake']),
   payload: z.any().optional()
 });
 

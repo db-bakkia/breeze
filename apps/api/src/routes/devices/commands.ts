@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
 import { eq, sql, desc, and } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
 import { db } from '../../db';
 import { deviceCommands, devices } from '../../db/schema';
 import { authMiddleware, requireMfa, requireScope, requirePermission } from '../../middleware/auth';
@@ -10,7 +11,7 @@ import { getPagination, getDeviceWithOrgCheck } from './helpers';
 import { createCommandSchema, bulkCommandSchema, maintenanceModeSchema } from './schemas';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { commandAuditDetails, sanitizeCommandForHistory } from '../../services/commandAudit';
-import { dispatchWake } from '../../services/wakeOnLan';
+import { dispatchWake, type WakeFailureCode } from '../../services/wakeOnLan';
 import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
 
 export const commandsRoutes = new Hono();
@@ -39,6 +40,85 @@ commandsRoutes.post(
       return c.json({ error: 'Script commands must be executed through the scripts endpoint' }, 400);
     }
 
+    const deviceIds = [...new Set(data.deviceIds)];
+
+    // Wake-on-LAN takes a separate path from the generic device_commands
+    // insertion: each device needs a relay picked on its LAN, the command
+    // row is addressed to that relay (not the offline target), and the
+    // dispatch result includes per-device failure codes (NO_RELAY,
+    // NO_MACS, etc.) that the UI surfaces in a grouped summary. See
+    // services/wakeOnLan.ts + Discussion #694.
+    if (data.type === 'wake') {
+      const bulkId = randomUUID();
+      const succeeded: Array<{
+        deviceId: string;
+        commandId: string;
+        wakeAttemptId: string;
+        relayDeviceId: string;
+        relayHostname: string;
+        broadcast: string;
+      }> = [];
+      const failed: Array<{
+        deviceId: string;
+        code: WakeFailureCode | 'DECOMMISSIONED' | 'TARGET_NOT_FOUND';
+        message: string;
+      }> = [];
+      const ipAddress = getTrustedClientIpOrUndefined(c);
+      const userAgent = c.req.header('user-agent');
+
+      // Inline worker pool. dispatchWake does 5-7 DB selects + 2 inserts +
+      // 1 update + 1 WS write per device (no locks/transactions per
+      // services/wakeOnLan.ts). Concurrency 8 caps overlap on the
+      // breeze_app pool (~10-20 conns) and keeps wall time on a 500-device
+      // bulk well under Cloudflare's ~100s proxy timeout. Avoided a
+      // p-limit dependency by inlining — the loop is trivial.
+      const CONCURRENCY = 8;
+      const queue = [...deviceIds];
+      async function worker(): Promise<void> {
+        for (;;) {
+          const deviceId = queue.shift();
+          if (!deviceId) return;
+          // Per-device authorization — partner-scope filtering happens in
+          // getDeviceWithOrgCheck (helpers.ts). dispatchWake itself does
+          // NOT independently authorize the caller, so this gate must run
+          // before the wake dispatches.
+          const device = await getDeviceWithOrgCheck(deviceId, auth);
+          if (!device) {
+            failed.push({ deviceId, code: 'TARGET_NOT_FOUND', message: 'Device not found or access denied.' });
+            continue;
+          }
+          if (device.status === 'decommissioned') {
+            failed.push({ deviceId, code: 'DECOMMISSIONED', message: 'Cannot wake a decommissioned device.' });
+            continue;
+          }
+          const result = await dispatchWake(deviceId, auth.user.id, {
+            ipAddress,
+            userAgent,
+            bulkId,
+          });
+          if (result.ok) {
+            succeeded.push({
+              deviceId,
+              commandId: result.commandId,
+              wakeAttemptId: result.wakeAttemptId,
+              relayDeviceId: result.relayDeviceId,
+              relayHostname: result.relayHostname,
+              broadcast: result.broadcast,
+            });
+          } else {
+            failed.push({ deviceId, code: result.code, message: result.message });
+          }
+        }
+      }
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY, deviceIds.length) },
+        () => worker(),
+      );
+      await Promise.all(workers);
+
+      return c.json({ bulkId, succeeded, failed }, 202);
+    }
+
     const commandList: Array<{
       id: string;
       deviceId: string;
@@ -47,7 +127,6 @@ commandsRoutes.post(
       createdAt: Date;
     }> = [];
     const failed: string[] = [];
-    const deviceIds = [...new Set(data.deviceIds)];
 
     for (const deviceId of deviceIds) {
       const device = await getDeviceWithOrgCheck(deviceId, auth);

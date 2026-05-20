@@ -116,6 +116,101 @@ export async function sendWakeCommand(deviceId: string): Promise<WakeResponse> {
   return await response.json();
 }
 
+/** Bulk-wake result codes — same as WakeFailureCode plus two bulk-only
+ *  shapes the bulk handler emits before reaching dispatchWake. */
+export type BulkWakeFailureCode =
+  | WakeFailureCode
+  | 'DECOMMISSIONED'
+  // The bulk handler also emits TARGET_NOT_FOUND for "not found OR
+  // partner-scope access denied" — same as dispatchWake's own
+  // TARGET_NOT_FOUND but raised earlier (before dispatchWake is invoked).
+  ;
+
+export interface BulkWakeSucceeded {
+  deviceId: string;
+  commandId: string;
+  wakeAttemptId: string;
+  relayDeviceId: string;
+  relayHostname: string;
+  broadcast: string;
+}
+
+export interface BulkWakeFailed {
+  deviceId: string;
+  code: BulkWakeFailureCode;
+  message: string;
+}
+
+export interface BulkWakeSummary {
+  bulkId: string;
+  succeeded: BulkWakeSucceeded[];
+  failed: BulkWakeFailed[];
+}
+
+/**
+ * Bulk Wake-on-LAN — one HTTP round-trip, server iterates per-device with
+ * a relay-pick per LAN. Server response includes per-device outcome with
+ * the original WakeFailureCode preserved so the UI can group failures
+ * by reason in the summary toast.
+ *
+ * 412/422 from the server (validation, decommissioned-only selection,
+ * etc.) is surfaced as a thrown Error so the caller's catch path can
+ * show a single error toast instead of treating the entire batch as
+ * "0 succeeded."
+ */
+export async function sendBulkWakeCommand(deviceIds: string[]): Promise<BulkWakeSummary> {
+  const response = await fetchWithAuth('/devices/bulk/commands', {
+    method: 'POST',
+    body: JSON.stringify({ deviceIds, type: 'wake' })
+  });
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response, 'Failed to send bulk wake command'));
+  }
+  return await response.json();
+}
+
+/**
+ * Render a one-line failure-code summary suitable for the bulk-wake toast,
+ * grouping by code. Returns an empty string when there are no failures.
+ *
+ * Example: "3 have no online peer at their site; 1 has no MAC on file"
+ */
+export function summarizeBulkWakeFailures(failed: BulkWakeFailed[]): string {
+  if (failed.length === 0) return '';
+  const buckets: Record<string, number> = {};
+  for (const f of failed) {
+    const label = bulkWakeFailureLabel(f.code);
+    buckets[label] = (buckets[label] ?? 0) + 1;
+  }
+  return Object.entries(buckets)
+    .map(([label, count]) => `${count} ${label}`)
+    .join('; ');
+}
+
+function bulkWakeFailureLabel(code: string): string {
+  switch (code) {
+    case 'NO_RELAY':
+      return 'with no online peer at their site';
+    case 'NO_MACS':
+      return 'with no MAC on file (agent has not checked in)';
+    case 'NO_SUBNET':
+    case 'IPV6_ONLY':
+      return 'with no usable IPv4 history';
+    case 'WS_SEND_FAILED':
+      return 'had relay disconnect mid-dispatch — retry';
+    case 'TARGET_NOT_FOUND':
+      return 'not found or access denied';
+    case 'DECOMMISSIONED':
+      return 'decommissioned';
+    case 'RELAY_OVERRIDE_INVALID':
+      // Bulk path never uses override; surface generically if it ever
+      // does appear so we notice in telemetry.
+      return 'with invalid relay override';
+    default:
+      return `with error ${code}`;
+  }
+}
+
 export async function sendBulkCommand(
   deviceIds: string[],
   type: string,

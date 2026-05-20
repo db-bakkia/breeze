@@ -66,10 +66,19 @@ vi.mock('../../services/auditEvents', () => ({
   writeRouteAudit: vi.fn()
 }));
 
+vi.mock('../../services/wakeOnLan', () => ({
+  dispatchWake: vi.fn(),
+}));
+
+vi.mock('../../services/clientIp', () => ({
+  getTrustedClientIpOrUndefined: vi.fn(() => '127.0.0.1'),
+}));
+
 import { commandsRoutes } from './commands';
 import { db } from '../../db';
 import { getDeviceWithOrgCheck } from './helpers';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { dispatchWake } from '../../services/wakeOnLan';
 
 describe('device commands routes', () => {
   let app: Hono;
@@ -132,6 +141,172 @@ describe('device commands routes', () => {
       const body = await res.json();
       expect(body.error).toContain('scripts endpoint');
       expect(vi.mocked(getDeviceWithOrgCheck)).not.toHaveBeenCalled();
+    });
+
+    describe('bulk-wake (type=wake)', () => {
+      const onlineDevice = (id: string) =>
+        ({ id, orgId: 'org-123', status: 'online', hostname: `host-${id.slice(0, 4)}` } as never);
+
+      it('iterates dispatchWake per device and returns per-device outcomes with a shared bulkId', async () => {
+        // 3 devices: 2 wake-able, 1 with no relay
+        vi.mocked(getDeviceWithOrgCheck)
+          .mockResolvedValueOnce(onlineDevice('11111111-1111-1111-1111-111111111111'))
+          .mockResolvedValueOnce(onlineDevice('22222222-2222-2222-2222-222222222222'))
+          .mockResolvedValueOnce(onlineDevice('33333333-3333-3333-3333-333333333333'));
+
+        vi.mocked(dispatchWake)
+          .mockResolvedValueOnce({
+            ok: true,
+            commandId: 'cmd-1',
+            wakeAttemptId: 'wake-1',
+            targetDeviceId: '11111111-1111-1111-1111-111111111111',
+            targetHostname: 'host-1111',
+            relayDeviceId: 'relay-1',
+            relayHostname: 'relay-host-1',
+            network: '10.10.10.0',
+            broadcast: '10.10.10.255',
+            maskSource: 'agent',
+            macs: ['aa:bb:cc:dd:ee:01'],
+          })
+          .mockResolvedValueOnce({
+            ok: false,
+            code: 'NO_RELAY',
+            message: 'No online peer agent is available at the target\'s site and subnet to relay the Wake-on-LAN packet.',
+          })
+          .mockResolvedValueOnce({
+            ok: true,
+            commandId: 'cmd-3',
+            wakeAttemptId: 'wake-3',
+            targetDeviceId: '33333333-3333-3333-3333-333333333333',
+            targetHostname: 'host-3333',
+            relayDeviceId: 'relay-2',
+            relayHostname: 'relay-host-2',
+            network: '10.10.20.0',
+            broadcast: '10.10.20.255',
+            maskSource: 'agent',
+            macs: ['aa:bb:cc:dd:ee:03'],
+          });
+
+        const res = await app.request('/devices/bulk/commands', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({
+            deviceIds: [
+              '11111111-1111-1111-1111-111111111111',
+              '22222222-2222-2222-2222-222222222222',
+              '33333333-3333-3333-3333-333333333333',
+            ],
+            type: 'wake',
+          }),
+        });
+
+        expect(res.status).toBe(202);
+        const body = await res.json();
+        expect(body.bulkId).toMatch(/^[0-9a-f-]{36}$/);
+        expect(body.succeeded).toHaveLength(2);
+        expect(body.failed).toHaveLength(1);
+        expect(body.failed[0]).toMatchObject({
+          deviceId: '22222222-2222-2222-2222-222222222222',
+          code: 'NO_RELAY',
+        });
+
+        // Every dispatchWake call received the same bulkId so audit
+        // rows can be correlated to one user click.
+        const calls = vi.mocked(dispatchWake).mock.calls;
+        expect(calls).toHaveLength(3);
+        const bulkIds = new Set(calls.map(([, , opts]) => (opts as any).bulkId));
+        expect(bulkIds.size).toBe(1);
+        expect(bulkIds.has(body.bulkId)).toBe(true);
+      });
+
+      it('returns DECOMMISSIONED for decommissioned devices without calling dispatchWake', async () => {
+        vi.mocked(getDeviceWithOrgCheck).mockResolvedValueOnce(
+          { id: '11111111-1111-1111-1111-111111111111', orgId: 'org-123', status: 'decommissioned', hostname: 'host-1111' } as never,
+        );
+
+        const res = await app.request('/devices/bulk/commands', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({
+            deviceIds: ['11111111-1111-1111-1111-111111111111'],
+            type: 'wake',
+          }),
+        });
+
+        expect(res.status).toBe(202);
+        const body = await res.json();
+        expect(body.succeeded).toHaveLength(0);
+        expect(body.failed).toEqual([
+          {
+            deviceId: '11111111-1111-1111-1111-111111111111',
+            code: 'DECOMMISSIONED',
+            message: 'Cannot wake a decommissioned device.',
+          },
+        ]);
+        expect(vi.mocked(dispatchWake)).not.toHaveBeenCalled();
+      });
+
+      it('returns TARGET_NOT_FOUND when getDeviceWithOrgCheck filters out a cross-org device', async () => {
+        // null = either not found OR partner-scope access denied. Either way,
+        // partner-scope safety: dispatchWake is never invoked.
+        vi.mocked(getDeviceWithOrgCheck).mockResolvedValueOnce(null as never);
+
+        const res = await app.request('/devices/bulk/commands', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({
+            deviceIds: ['11111111-1111-1111-1111-111111111111'],
+            type: 'wake',
+          }),
+        });
+
+        expect(res.status).toBe(202);
+        const body = await res.json();
+        expect(body.failed[0]).toMatchObject({
+          deviceId: '11111111-1111-1111-1111-111111111111',
+          code: 'TARGET_NOT_FOUND',
+        });
+        expect(vi.mocked(dispatchWake)).not.toHaveBeenCalled();
+      });
+
+      it('schema rejects deviceIds.length > 500 (BULK_COMMAND_MAX_DEVICES cap)', async () => {
+        const tooManyIds = Array.from({ length: 501 }, (_, i) => {
+          const hex = i.toString(16).padStart(12, '0');
+          return `00000000-0000-0000-0000-${hex}`;
+        });
+        const res = await app.request('/devices/bulk/commands', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({ deviceIds: tooManyIds, type: 'wake' }),
+        });
+        expect(res.status).toBe(400);
+        expect(vi.mocked(getDeviceWithOrgCheck)).not.toHaveBeenCalled();
+        expect(vi.mocked(dispatchWake)).not.toHaveBeenCalled();
+      });
+
+      it('schema accepts type=wake', async () => {
+        // Sanity check that the enum is in fact extended; the dispatchWake
+        // path is mocked to a single failure to avoid setting up successful
+        // returns — we only care that validation passes.
+        vi.mocked(getDeviceWithOrgCheck).mockResolvedValueOnce(
+          onlineDevice('11111111-1111-1111-1111-111111111111'),
+        );
+        vi.mocked(dispatchWake).mockResolvedValueOnce({
+          ok: false,
+          code: 'NO_MACS',
+          message: 'no mac',
+        });
+
+        const res = await app.request('/devices/bulk/commands', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({
+            deviceIds: ['11111111-1111-1111-1111-111111111111'],
+            type: 'wake',
+          }),
+        });
+        expect(res.status).toBe(202);
+      });
     });
   });
 

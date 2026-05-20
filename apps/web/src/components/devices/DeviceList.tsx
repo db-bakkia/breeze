@@ -590,6 +590,14 @@ export default function DeviceList({
                 <hr className="my-1" />
                 <button
                   type="button"
+                  onClick={() => handleBulkAction('wake')}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted"
+                >
+                  Wake Selected
+                </button>
+                <hr className="my-1" />
+                <button
+                  type="button"
                   onClick={() => handleBulkAction('decommission')}
                   className="w-full px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
                 >

@@ -12,7 +12,7 @@ import AddDeviceModal from './AddDeviceModal';
 import CreateGroupModal from './CreateGroupModal';
 import { DeviceFilterBar } from '../filters/DeviceFilterBar';
 import { fetchWithAuth } from '../../stores/auth';
-import { sendDeviceCommand, sendBulkCommand, executeScript, toggleMaintenanceMode, decommissionDevice, bulkDecommissionDevices, restoreDevice, permanentDeleteDevice, sendWakeCommand, WakeCommandError, wakeFriendlyErrorMessage } from '../../services/deviceActions';
+import { sendDeviceCommand, sendBulkCommand, executeScript, toggleMaintenanceMode, decommissionDevice, bulkDecommissionDevices, restoreDevice, permanentDeleteDevice, sendWakeCommand, sendBulkWakeCommand, summarizeBulkWakeFailures, WakeCommandError, wakeFriendlyErrorMessage } from '../../services/deviceActions';
 import { navigateTo } from '@/lib/navigation';
 import { getErrorMessage, getErrorTitle } from '@/lib/errorMessages';
 import { asRecord, toPercent } from '@/lib/deviceUtils';
@@ -470,6 +470,32 @@ export default function DevicesPage() {
             showToast({ type: 'error', message: `${result.succeeded} decommissioned, ${result.failed} failed` });
           }
           await fetchDevices();
+          break;
+        }
+
+        case 'wake': {
+          // One round-trip; server iterates per-device with relay-pick per LAN
+          // and returns per-device outcome. We render one summary toast
+          // grouped by failure code so a 50-device bulk doesn't spam 50
+          // toasts.
+          const summary = await sendBulkWakeCommand(deviceIds);
+          const failureSummary = summarizeBulkWakeFailures(summary.failed);
+          if (summary.failed.length === 0) {
+            showToast({
+              type: 'success',
+              message: `Wake packets sent to ${summary.succeeded.length} device${summary.succeeded.length === 1 ? '' : 's'}. Allow up to 5 minutes to come online.`,
+            });
+          } else if (summary.succeeded.length === 0) {
+            showToast({
+              type: 'error',
+              message: `Could not wake any of ${summary.failed.length} device${summary.failed.length === 1 ? '' : 's'}: ${failureSummary}.`,
+            });
+          } else {
+            showToast({
+              type: 'error',
+              message: `Wake sent to ${summary.succeeded.length} of ${summary.succeeded.length + summary.failed.length} devices. ${summary.failed.length} could not be woken: ${failureSummary}.`,
+            });
+          }
           break;
         }
 
