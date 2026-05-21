@@ -538,6 +538,35 @@ export const changeActionValues = [
   'updated'
 ] as const;
 
+/**
+ * Per-request cap on `submitChangesSchema.changes[]`. Resolved + clamped
+ * once at module-load so a misconfigured env var (NaN, 0, negative,
+ * unbounded) can never propagate into `z.array().max(...)` and either
+ * (a) reject every legitimate ingest, fleet-wide, with a generic 400,
+ * or (b) make the array length effectively unbounded.
+ *
+ * Default 50000 was chosen to fit large Linux package-inventory deltas
+ * under the existing 5 MB body / 10 MB decompressed guards in
+ * `changes.ts:66-77`. The hard ceiling of 200000 is the safety stop
+ * even if an operator sets the env var to something unreasonable —
+ * matches the rationale in #752 review (Todd, 2026-05-19).
+ */
+const CHANGE_INGEST_MAX_ITEMS_DEFAULT = 50000;
+const CHANGE_INGEST_MAX_ITEMS_CEILING = 200000;
+function resolveChangeIngestMaxItems(): number {
+  const raw = process.env.CHANGE_INGEST_MAX_ITEMS;
+  if (!raw) return CHANGE_INGEST_MAX_ITEMS_DEFAULT;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > CHANGE_INGEST_MAX_ITEMS_CEILING) {
+    return CHANGE_INGEST_MAX_ITEMS_DEFAULT;
+  }
+  return parsed;
+}
+export const CHANGE_INGEST_MAX_ITEMS = resolveChangeIngestMaxItems();
+// Re-exported for tests of the resolver. Production code reads
+// CHANGE_INGEST_MAX_ITEMS (the resolved value) directly.
+export const __resolveChangeIngestMaxItemsForTests = resolveChangeIngestMaxItems;
+
 export const submitChangesSchema = z.object({
   changes: z.array(z.object({
     timestamp: z.string().datetime({ offset: true }),
@@ -556,7 +585,7 @@ export const submitChangesSchema = z.object({
       (value) => !value || JSON.stringify(value).length <= 65535,
       { message: 'details too large (max 64KB)' }
     ),
-  })).max(1000).default([])
+  })).max(CHANGE_INGEST_MAX_ITEMS).default([])
 });
 
 // ============================================
