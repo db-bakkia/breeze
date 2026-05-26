@@ -362,6 +362,251 @@ describe('POST /agents/enroll — 401 reason disambiguation', () => {
     const body = await resp.json();
     expect(body.reason).toBe('hostname_collision_requires_existing_device_token');
   });
+
+  it('allows re-enrollment without the existing-device token when the existing row is decommissioned', async () => {
+    // Real-world scenario (Trevor-Legion, 2026-05-25):
+    // 1. Admin calls DELETE /api/v1/devices/<id> — soft-deletes, status=decommissioned
+    // 2. Operator uninstalls Breeze on the endpoint and re-runs the installer
+    // 3. Fresh agent has no prior token; re-enrolls
+    // Pre-fix: hostname-collision check returned 409 even for decommissioned
+    // rows, leaving the host permanently un-enrollable without a hand-rename
+    // in SQL. Post-fix: decommissioned rows are treated as authenticated for
+    // re-enrollment, and the existing row is restored/updated in-place so
+    // history (agent_logs etc.) survives.
+    mockKeyLookup({
+      id: 'key-decom',
+      orgId: 'org-decom',
+      siteId: 'site-decom',
+      keySecretHash: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+      maxUsage: 10,
+      usageCount: 0,
+    });
+
+    // Claim the enrollment key
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn().mockResolvedValue([{
+            id: 'key-decom',
+            orgId: 'org-decom',
+            siteId: 'site-decom',
+          }]),
+        })),
+      })),
+    } as any);
+
+    mockSelectRows([{ partnerId: 'partner-decom' }]);
+    mockSelectRows([{ maxDevices: null }]);
+    // Existing row is DECOMMISSIONED — no token attached to the request
+    mockSelectRows([{
+      id: 'device-decom-existing',
+      status: 'decommissioned',
+      agentTokenHash: 'old-decom-hash',
+      previousTokenHash: null,
+      previousTokenExpiresAt: null,
+    }]);
+
+    // Auto-restore: db.update flipping status decommissioned -> offline
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue(undefined),
+      })),
+    } as any);
+
+    // Transaction: device is existing, so the inner branch is tx.update().returning()
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => {
+      const fakeTx = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 0 }]),
+          }),
+        }),
+        update: vi.fn().mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{
+                id: 'device-decom-existing',
+                orgId: 'org-decom',
+                siteId: 'site-decom',
+                hostname: 'host-1',
+              }]),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockReturnValue({
+          values: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([]),
+            onConflictDoUpdate: vi.fn().mockResolvedValue(undefined),
+          }),
+        }),
+        delete: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      };
+      return fn(fakeTx);
+    });
+
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(baseEnrollBody),
+    });
+
+    expect(resp.status).toBe(201);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.deviceId).toBe('device-decom-existing');
+    // Importantly: no 409 audit event was written for hostname_collision
+    expect(writeAuditEvent).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          reason: 'hostname_collision_requires_existing_device_token',
+        }),
+      })
+    );
+    // AND: an audit row was written for the admin-approved replacement bypass
+    expect(writeAuditEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'agent.enroll',
+        resourceId: 'device-decom-existing',
+        result: 'success',
+        details: expect.objectContaining({
+          reason: 'decommissioned_row_reenrolled',
+          priorDeviceId: 'device-decom-existing',
+        }),
+      })
+    );
+  });
+
+  it('regression: status=offline (not decommissioned) still 409s without an existing-device token', async () => {
+    // Defense against future refactors that might widen the decommissioned
+    // bypass — make sure 'offline' rows continue to require the prior token.
+    mockKeyLookup({
+      id: 'key-offline',
+      orgId: 'org-offline',
+      siteId: 'site-offline',
+      keySecretHash: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+      maxUsage: 10,
+      usageCount: 0,
+    });
+
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn().mockResolvedValue([{
+            id: 'key-offline',
+            orgId: 'org-offline',
+            siteId: 'site-offline',
+          }]),
+        })),
+      })),
+    } as any);
+
+    mockSelectRows([{ partnerId: 'partner-offline' }]);
+    mockSelectRows([{ maxDevices: null }]);
+    // Existing row is OFFLINE (the normal "device hasn't checked in" state),
+    // NOT decommissioned — no token attached to request.
+    mockSelectRows([{
+      id: 'device-offline-existing',
+      status: 'offline',
+      agentTokenHash: 'old-offline-hash',
+      previousTokenHash: null,
+      previousTokenExpiresAt: null,
+    }]);
+
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(baseEnrollBody),
+    });
+
+    expect(resp.status).toBe(409);
+    const body = await resp.json();
+    expect(body.reason).toBe('hostname_collision_requires_existing_device_token');
+  });
+
+  it('denies re-enrollment when the existing row is decommissioned AND its token was probe-suspended', async () => {
+    // Suspension trumps decommission. Task 18 added auto-suspend-on-probe
+    // (commit 2669ea43); the maintainer's explicit intent is that
+    // unsuspending be manual — "the reconnect-loop on a single device is the
+    // desired ops alarm signal." An admin DELETE of a probe-suspended device
+    // must NOT auto-restore the slot. The operator has to clear
+    // agent_token_suspended_at deliberately first, which leaves an audit
+    // trail of the "yes, I cleared a security suspension" decision.
+    //
+    // Real-world sequence A: probe-storm suspended the token at t=0, ops
+    // alarm fired (reconnect-loop), admin investigated, decided the box was
+    // compromised/abandoned, and decommissioned it. Without this gate, the
+    // hostname could silently re-enroll with fresh tokens after the
+    // suspension alarm fired — defeating the security signal.
+    mockKeyLookup({
+      id: 'key-suspended-decom',
+      orgId: 'org-suspended-decom',
+      siteId: 'site-suspended-decom',
+      keySecretHash: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+      maxUsage: 10,
+      usageCount: 0,
+    });
+
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn().mockResolvedValue([{
+            id: 'key-suspended-decom',
+            orgId: 'org-suspended-decom',
+            siteId: 'site-suspended-decom',
+          }]),
+        })),
+      })),
+    } as any);
+
+    mockSelectRows([{ partnerId: 'partner-suspended-decom' }]);
+    mockSelectRows([{ maxDevices: null }]);
+    // Existing row: DECOMMISSIONED AND token-suspended.
+    mockSelectRows([{
+      id: 'device-suspended-decom',
+      status: 'decommissioned',
+      agentTokenHash: 'old-suspended-hash',
+      previousTokenHash: null,
+      previousTokenExpiresAt: null,
+      agentTokenSuspendedAt: new Date('2026-05-25T12:00:00Z'),
+    }]);
+
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(baseEnrollBody),
+    });
+
+    expect(resp.status).toBe(409);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.reason).toBe('existing_decommissioned_row_has_suspended_token');
+    // Audit row was written denying the attempt — not silently allowed.
+    expect(writeAuditEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'agent.enroll',
+        resourceId: 'device-suspended-decom',
+        result: 'denied',
+        details: expect.objectContaining({
+          reason: 'existing_decommissioned_row_has_suspended_token',
+        }),
+      })
+    );
+    // NOT the decom-bypass success audit
+    expect(writeAuditEvent).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          reason: 'decommissioned_row_reenrolled',
+        }),
+      })
+    );
+  });
 });
 
 describe('POST /agents/enroll — ENROLLMENT_SECRET_ENFORCEMENT_MODE', () => {
