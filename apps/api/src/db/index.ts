@@ -123,6 +123,19 @@ export async function withSystemDbAccessContext<T>(fn: () => Promise<T>): Promis
   return withDbAccessContext(SYSTEM_DB_ACCESS_CONTEXT, fn);
 }
 
+/**
+ * True when the current async scope is inside an active
+ * `withDbAccessContext` / `withSystemDbAccessContext` call. Use to assert
+ * RLS context is established before a tenant-scoped query in code paths
+ * where a bare-pool fallback would be a silent security bug
+ * (e.g. PAM auto-elevation lookups — a missing context falls back to the
+ * unprivileged `breeze_app` role with no GUC, RLS denies, and the caller
+ * sees a silent empty result instead of an auto-deny).
+ */
+export function hasDbAccessContext(): boolean {
+  return dbContextStorage.getStore() !== undefined;
+}
+
 export type RunOutsideDbContextFn = <T>(fn: () => T) => T;
 
 /**

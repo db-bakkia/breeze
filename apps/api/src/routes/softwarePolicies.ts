@@ -49,10 +49,29 @@ const softwareRuleSchema = z.object({
   reason: z.string().min(1).max(1000).optional(),
 });
 
-const softwareRulesSchema = z.object({
-  software: z.array(softwareRuleSchema).min(1),
-  allowUnknown: z.boolean().optional(),
+// PAM executable rule (parallel to softwareRuleSchema, consumed by the
+// PAM bridge — not the inventory matcher). sha256 regex is case-insensitive
+// for input; the DB CHECK constraint stores lowercase hex.
+export const executableRuleSchema = z.object({
+  name: z.string().min(1).max(200),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+  signer: z.string().max(255).optional(),
+  publisher: z.string().max(255).optional(),
+  pathGlob: z.string().max(500).optional(),
 });
+
+// Both software[] and executable[] are optional, but the policy must carry
+// at least one rule in at least one of them. A PAM-only policy
+// (executable[] populated, software[] empty/absent) is valid; an inventory-
+// only policy (software[] populated, executable[] absent) is valid.
+export const softwareRulesSchema = z.object({
+  software: z.array(softwareRuleSchema).optional(),
+  executable: z.array(executableRuleSchema).optional(),
+  allowUnknown: z.boolean().optional(),
+}).refine(
+  (r) => (r.software?.length ?? 0) > 0 || (r.executable?.length ?? 0) > 0,
+  { message: 'rules must include at least one software[] or executable[] entry' }
+);
 
 const remediationOptionsSchema = z.object({
   autoUninstall: z.boolean().optional(),
@@ -209,8 +228,8 @@ softwarePoliciesRoutes.post(
     }
 
     const rules = normalizeSoftwarePolicyRules(payload.rules);
-    if (rules.software.length === 0) {
-      return c.json({ error: 'At least one software rule is required' }, 400);
+    if (rules.software.length === 0 && (rules.executable?.length ?? 0) === 0) {
+      return c.json({ error: 'At least one software or executable rule is required' }, 400);
     }
 
     const [policy] = await db
@@ -261,7 +280,7 @@ softwarePoliciesRoutes.post(
       details: {
         mode: policy.mode,
         enforceMode: policy.enforceMode,
-        rules: rules.software.length,
+        rules: rules.software.length + (rules.executable?.length ?? 0),
         scheduleWarning,
       },
     });
@@ -403,8 +422,8 @@ softwarePoliciesRoutes.patch(
 
     if (payload.rules !== undefined) {
       const normalizedRules = normalizeSoftwarePolicyRules(payload.rules);
-      if (normalizedRules.software.length === 0) {
-        return c.json({ error: 'At least one software rule is required' }, 400);
+      if (normalizedRules.software.length === 0 && (normalizedRules.executable?.length ?? 0) === 0) {
+        return c.json({ error: 'At least one software or executable rule is required' }, 400);
       }
       updates.rules = normalizedRules;
     }
