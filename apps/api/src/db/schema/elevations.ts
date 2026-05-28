@@ -43,6 +43,11 @@ export const elevationStatusEnum = pgEnum('elevation_status', [
   'denied',
   'expired',
   'revoked',
+  // 'actuating' = Track 5 single-use guard. Atomic CAS from 'approved' by
+  // the actuator route; row stays here until the agent reports completion
+  // (Track 6 — JIT credential expiry / cleanup), at which point it flips to
+  // 'expired' or 'revoked'.
+  'actuating',
 ]);
 
 export const elevationAuditEventTypeEnum = pgEnum('elevation_audit_event_type', [
