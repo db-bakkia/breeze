@@ -58,6 +58,7 @@ const (
 	CmdCollectSoftware   = "collect_software"
 	CmdSoftwareUninstall = "software_uninstall"
 	CmdSoftwareInstall   = "software_install"
+	CmdSoftwareUpdate    = "software_update"
 
 	// Boot performance
 	CmdCollectBootPerformance    = "collect_boot_performance"

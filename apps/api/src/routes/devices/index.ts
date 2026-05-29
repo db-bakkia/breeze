@@ -20,6 +20,7 @@ import { warrantyRoutes } from './warranty';
 import { provisionRoutes } from './provision';
 import { moveOrgRoutes } from './moveOrg';
 import { actuateElevationRoutes } from './actuateElevation';
+import { softwareActionsRoutes } from './softwareActions';
 
 export const deviceRoutes = new Hono();
 
@@ -45,6 +46,12 @@ deviceRoutes.route('/', coreRoutes);
 
 // Mount sub-resource routes
 deviceRoutes.route('/', metricsRoutes);
+// Mount softwareActionsRoutes BEFORE softwareRoutes so the POST /:id/software/update
+// + /:id/software/uninstall handlers are registered ahead of any future
+// software.ts handlers that might shadow them. Different verbs today (POST vs
+// the existing GET /:id/software) means there's no actual conflict, but ordering
+// the more-specific paths first matches the existing static-before-:id convention.
+deviceRoutes.route('/', softwareActionsRoutes);
 deviceRoutes.route('/', softwareRoutes);
 deviceRoutes.route('/', commandsRoutes);
 deviceRoutes.route('/', hardwareRoutes);

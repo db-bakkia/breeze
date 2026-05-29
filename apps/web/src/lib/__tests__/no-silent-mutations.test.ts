@@ -37,6 +37,7 @@ const TARGET_GLOBS = [
   'src/components/dnsSecurity/AddDnsIntegrationModal.tsx',
   'src/components/dnsSecurity/DnsSecurityPoliciesTab.tsx',
   'src/components/dnsSecurity/AddDnsPolicyModal.tsx',
+  'src/components/devices/DeviceSoftwareInventory.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -228,7 +229,7 @@ describe('migration backlog integrity', () => {
 // ─── Main guard ─────────────────────────────────────────────────────────────
 describe('no silent mutations in targeted set', () => {
   it('finds files to scan', () => {
-    expect(absoluteFiles.length).toBe(9);
+    expect(absoluteFiles.length).toBe(10);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

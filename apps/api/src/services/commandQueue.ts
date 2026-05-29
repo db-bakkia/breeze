@@ -85,6 +85,7 @@ export const CommandTypes = {
 
   // Software management
   SOFTWARE_UNINSTALL: 'software_uninstall',
+  SOFTWARE_UPDATE: 'software_update',
   CIS_BENCHMARK: 'cis_benchmark',
   APPLY_CIS_REMEDIATION: 'apply_cis_remediation',
 
@@ -247,6 +248,7 @@ const AUDITED_COMMANDS: Set<string> = new Set([
   CommandTypes.INSTALL_PATCHES,
   CommandTypes.ROLLBACK_PATCHES,
   CommandTypes.SOFTWARE_UNINSTALL,
+  CommandTypes.SOFTWARE_UPDATE,
   CommandTypes.CIS_BENCHMARK,
   CommandTypes.APPLY_CIS_REMEDIATION,
   CommandTypes.SECURITY_SCAN,
