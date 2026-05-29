@@ -385,6 +385,11 @@ const envSchema = z
     BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: z.string().optional(),
     IS_HOSTED: z.string().optional(),
 
+    // MFA feature flag. When false, ALL requireMfa() gates become no-ops.
+    // Warning is emitted in collectWarnings; we do NOT refuse boot (a
+    // self-hosted operator may deliberately run 2FA-off).
+    ENABLE_2FA: z.string().optional(),
+
     // OAuth Dynamic Client Registration (DCR) hardening. Both default OFF.
     // See env.ts and provider.ts for the runtime read-paths; the
     // production-only validation in superRefine refuses boot when
@@ -966,6 +971,28 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
     // it's missing or weak.)
   }
 
+  // Warn when 2FA is globally disabled: this neuters ALL requireMfa() step-up
+  // gates across the entire API, not just /auth/mfa endpoints. Non-fatal — a
+  // self-hosted operator may deliberately run 2FA-off; we must not lock them
+  // out. See: Finding #3 (security review May 2026).
+  //
+  // Mirror envFlag('ENABLE_2FA', true) exactly: it disables on ANY value that
+  // isn't in the truthy set (so ENABLE_2FA=disabled / nope also disable 2FA).
+  // Match that here so the warning fires for every disabling value, not just
+  // the obvious false/0/no/off ones.
+  const enable2faRaw = (env.ENABLE_2FA ?? '').trim().toLowerCase();
+  const enable2faSetButFalsy =
+    enable2faRaw !== '' && !['1', 'true', 'yes', 'on'].includes(enable2faRaw);
+  if (enable2faSetButFalsy) {
+    warnings.push({
+      key: 'ENABLE_2FA',
+      message:
+        'ENABLE_2FA=false disables ALL requireMfa() step-up gates (admin/abuse, ' +
+        'tenant export/erasure, remote access, API keys, SSO, backups) — not just ' +
+        'the /auth/mfa endpoints. Strongly discouraged in production.',
+    });
+  }
+
   // Warn about optional secrets that look insecure
   const optionalSecrets = [
     'AGENT_ENROLLMENT_SECRET',
@@ -1035,6 +1062,7 @@ export function validateConfig(): AppConfig {
     RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS,
     BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: env.BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS,
     IS_HOSTED: env.IS_HOSTED,
+    ENABLE_2FA: env.ENABLE_2FA,
     OAUTH_DCR_ENABLED: env.OAUTH_DCR_ENABLED,
     OAUTH_DCR_REQUIRE_IAT: env.OAUTH_DCR_REQUIRE_IAT,
     // Task 26 (H-3): feature-flagged production secrets.

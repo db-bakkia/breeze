@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -415,3 +416,257 @@ func TestWatchdogDefaults(t *testing.T) {
 		t.Errorf("MaxRestartsPer24h default: want 5, got %d", cfg.Watchdog.MaxRestartsPer24h)
 	}
 }
+
+// TestIsSecretYAMLKey verifies the drift-proof predicate that decides which
+// config keys belong in secrets.yaml vs agent.yaml. Finding #6.
+func TestIsSecretYAMLKey(t *testing.T) {
+	cases := map[string]bool{
+		// Explicit secret keys (named in the switch).
+		"auth_token":         true,
+		"watchdog_auth_token": true,
+		"mtls_cert_pem":      true,
+		"mtls_key_pem":       true,
+		"mtls_cert_expires":  true,
+		// Caught by suffix rules (_access_key, _secret_key).
+		"backup_s3_access_key": true,
+		"backup_s3_secret_key": true,
+		// Caught by suffix rules (_password, _secret, _token).
+		"smtp_password": true,
+		"some_token":    true,
+		// Explicitly exempted: helper token MUST stay in agent.yaml for Helper.
+		"helper_auth_token": false,
+		// Non-secret keys that happen to contain "key" or "token" substrings
+		// but don't match any suffix rule.
+		"server_url":        false,
+		"agent_id":          false,
+		"backup_s3_bucket":  false,
+		"backup_s3_region":  false,
+	}
+	for key, want := range cases {
+		if got := isSecretYAMLKey(key); got != want {
+			t.Errorf("isSecretYAMLKey(%q) = %v, want %v", key, got, want)
+		}
+	}
+}
+
+// TestSaveToStripsBackupS3SecretsFromAgentYAML is the regression test for
+// Finding #6: backup_s3_access_key and backup_s3_secret_key must not appear in
+// agent.yaml (world-readable) after migration. This mirrors
+// TestMigrateInlineSecretsToSecretFileScrubsAgentYAML but exercises the
+// backup_s3_* keys that were absent from the original 5-key allowlist.
+// helper_auth_token must still be present in agent.yaml.
+func TestSaveToStripsBackupS3SecretsFromAgentYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+
+	// Write agent.yaml with inline backup_s3 secrets (old/misconfigured format).
+	if err := os.WriteFile(cfgPath, []byte(`
+agent_id: agent-backup-1
+server_url: https://api.example.test
+helper_auth_token: brz_helper
+backup_s3_bucket: my-bucket
+backup_s3_region: us-east-1
+backup_s3_access_key: AKIAIOSFODNN7EXAMPLE
+backup_s3_secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+`), 0o640); err != nil {
+		t.Fatalf("write agent.yaml: %v", err)
+	}
+
+	if err := migrateInlineSecretsToSecretFile(cfgPath); err != nil {
+		t.Fatalf("migrateInlineSecretsToSecretFile returned error: %v", err)
+	}
+
+	agentYAML, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read scrubbed agent.yaml: %v", err)
+	}
+	text := string(agentYAML)
+
+	// backup_s3_access_key and backup_s3_secret_key must NOT appear in agent.yaml.
+	for _, forbidden := range []string{
+		"backup_s3_access_key",
+		"backup_s3_secret_key",
+		"AKIAIOSFODNN7EXAMPLE",
+		"wJalrXUtnFEMI",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("scrubbed agent.yaml contains forbidden secret %q:\n%s", forbidden, text)
+		}
+	}
+
+	// Non-secret backup fields must remain in agent.yaml.
+	for _, required := range []string{"backup_s3_bucket: my-bucket", "backup_s3_region: us-east-1"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("scrubbed agent.yaml missing non-secret key %q:\n%s", required, text)
+		}
+	}
+
+	// helper_auth_token must remain in agent.yaml (Helper reads it).
+	if !strings.Contains(text, "helper_auth_token: brz_helper") {
+		t.Fatalf("scrubbed agent.yaml lost helper token:\n%s", text)
+	}
+
+	// secrets.yaml must contain the S3 credentials.
+	secretsYAML, err := os.ReadFile(filepath.Join(dir, "secrets.yaml"))
+	if err != nil {
+		t.Fatalf("read secrets.yaml: %v", err)
+	}
+	secretsText := string(secretsYAML)
+	for _, required := range []string{
+		"backup_s3_access_key: AKIAIOSFODNN7EXAMPLE",
+	} {
+		if !strings.Contains(secretsText, required) {
+			t.Fatalf("secrets.yaml missing %q:\n%s", required, secretsText)
+		}
+	}
+	if !strings.Contains(secretsText, "backup_s3_secret_key:") {
+		t.Fatalf("secrets.yaml missing backup_s3_secret_key:\n%s", secretsText)
+	}
+}
+
+// TestLoadReadsBackupS3FromSecrets is the companion to the strip test: verifies
+// that after backup_s3_* migrate to secrets.yaml, Load reads them back correctly
+// so that BackupS3AccessKey / BackupS3SecretKey are populated. Without this,
+// backup config silently breaks after the first migration. (Decision 3 companion.)
+//
+// This test writes agent.yaml + secrets.yaml by hand to mirror the on-disk state
+// produced by migrateInlineSecretsToSecretFile, then calls Load and asserts
+// that the credentials round-trip via the secrets read-back at config.go:265-282.
+func TestLoadReadsBackupS3FromSecrets(t *testing.T) {
+	defer viper.Reset()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	secretsPath := filepath.Join(dir, "secrets.yaml")
+
+	// agent.yaml after migration: no backup_s3 secrets, has non-secret backup fields.
+	agentYAML := `
+agent_id: ab3c20eddb470acffd33bbe00f25e0348e89298ab80cece542bb1fbf921e5776
+server_url: https://api.example.test
+backup_s3_bucket: my-bucket
+backup_s3_region: eu-west-1
+`
+	if err := os.WriteFile(cfgPath, []byte(agentYAML), 0o644); err != nil {
+		t.Fatalf("write agent.yaml: %v", err)
+	}
+
+	// secrets.yaml contains the migrated S3 credentials.
+	secretsYAML := `
+auth_token: brz_agent_s3
+backup_s3_access_key: AKIAIOSFODNN7EXAMPLE
+backup_s3_secret_key: wJalrXUtnFEMI/K7MDENG
+`
+	if err := os.WriteFile(secretsPath, []byte(secretsYAML), 0o600); err != nil {
+		t.Fatalf("write secrets.yaml: %v", err)
+	}
+
+	loaded, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.BackupS3AccessKey != "AKIAIOSFODNN7EXAMPLE" {
+		t.Fatalf("BackupS3AccessKey = %q, want AKIAIOSFODNN7EXAMPLE", loaded.BackupS3AccessKey)
+	}
+	if loaded.BackupS3SecretKey != "wJalrXUtnFEMI/K7MDENG" {
+		t.Fatalf("BackupS3SecretKey = %q, want wJalrXUtnFEMI/K7MDENG", loaded.BackupS3SecretKey)
+	}
+	// Non-secret fields must also be populated from agent.yaml.
+	if loaded.BackupS3Bucket != "my-bucket" {
+		t.Fatalf("BackupS3Bucket = %q, want my-bucket", loaded.BackupS3Bucket)
+	}
+	if loaded.BackupS3Region != "eu-west-1" {
+		t.Fatalf("BackupS3Region = %q, want eu-west-1", loaded.BackupS3Region)
+	}
+}
+
+// TestSaveToFailsWhenSecretsChmodFails verifies Finding #8: SaveTo must return
+// an error (not silently log a warning) when the secrets.yaml chmod enforcement
+// fails. This prevents a race window where secrets.yaml is world-readable.
+func TestSaveToFailsWhenSecretsChmodFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod injection is Unix-only; Windows DACLs covered by permissions_windows_test.go")
+	}
+	defer viper.Reset()
+
+	// Inject a failing chmod via the package-level var.
+	orig := enforceSecretFilePermissions
+	defer func() { enforceSecretFilePermissions = orig }()
+	enforceSecretFilePermissions = func(path string) error {
+		return errors.New("boom: simulated chmod failure")
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+
+	cfg := Default()
+	cfg.AgentID = "ab3c20eddb470acffd33bbe00f25e0348e89298ab80cece542bb1fbf921e5776"
+	cfg.ServerURL = "https://api.example.test"
+	cfg.AuthToken = "brz_agent_chmod"
+
+	err := SaveTo(cfg, cfgPath)
+	if err == nil {
+		t.Fatal("SaveTo returned nil; expected an error when secrets chmod fails")
+	}
+	if !strings.Contains(err.Error(), "secrets") {
+		t.Fatalf("error message does not reference secrets path: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("error message does not include the underlying cause: %v", err)
+	}
+}
+
+// TestStripSecretsFromAgentConfigFailsClosed verifies the strip helper fails
+// closed: on a YAML error it returns a wrapped error and NIL data, never the
+// original (unstripped) buffer. Previously it silently returned the original
+// secret-bearing buffer, which SaveTo then wrote to the 0644 agent.yaml.
+func TestStripSecretsFromAgentConfigFailsClosed(t *testing.T) {
+	// Malformed YAML (unterminated flow mapping) forces an unmarshal error.
+	malformed := []byte("auth_token: brz_super_secret\n{ this: is, not: valid")
+
+	out, err := stripSecretsFromAgentConfig(malformed)
+	if err == nil {
+		t.Fatal("stripSecretsFromAgentConfig returned nil error on malformed YAML; expected fail-closed error")
+	}
+	if out != nil {
+		t.Fatalf("stripSecretsFromAgentConfig returned non-nil data on error: %q (must never return the unstripped buffer)", out)
+	}
+	if strings.Contains(string(out), "brz_super_secret") {
+		t.Fatal("stripSecretsFromAgentConfig leaked the original secret-bearing buffer on error")
+	}
+}
+
+// TestSaveToAbortsWhenStripFails verifies the SaveTo fail-closed path: if
+// stripping secrets errors (here via the injected marshal hook), SaveTo returns
+// an error and does NOT write secrets to the world-readable agent.yaml.
+func TestSaveToAbortsWhenStripFails(t *testing.T) {
+	defer viper.Reset()
+
+	orig := stripMarshalForTests
+	defer func() { stripMarshalForTests = orig }()
+	stripMarshalForTests = func(any) ([]byte, error) {
+		return nil, errors.New("boom: simulated strip marshal failure")
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+
+	cfg := Default()
+	cfg.AgentID = "ab3c20eddb470acffd33bbe00f25e0348e89298ab80cece542bb1fbf921e5776"
+	cfg.ServerURL = "https://api.example.test"
+	cfg.AuthToken = "brz_agent_strip_secret"
+
+	err := SaveTo(cfg, cfgPath)
+	if err == nil {
+		t.Fatal("SaveTo returned nil; expected an error when secret stripping fails")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("error message does not include the underlying cause: %v", err)
+	}
+
+	// agent.yaml must NOT contain the secret. It may not exist at all (write
+	// aborted), which is fine — if it does exist, it must not carry the token.
+	data, readErr := os.ReadFile(cfgPath)
+	if readErr == nil && strings.Contains(string(data), "brz_agent_strip_secret") {
+		t.Fatalf("agent.yaml leaked the auth token after a failed strip: %q", data)
+	}
+}
+

@@ -24,6 +24,17 @@ export const actuateElevationRoutes = new Hono();
 
 actuateElevationRoutes.use('*', authMiddleware);
 
+// Guard: PAM actuator is DISABLED by default. Enable only when JIT credentials
+// + agent-side target re-validation (Track 6) are deployed. Same env-flag guard
+// STYLE as devPush.ts, but disabled by default in ALL environments (devPush only
+// gates production; it is on-by-default in dev).
+actuateElevationRoutes.use('*', async (c, next) => {
+  if (process.env.PAM_ACTUATOR_ENABLED !== 'true') {
+    return c.json({ error: 'PAM actuator is disabled' }, 403);
+  }
+  return next();
+});
+
 /**
  * POST /devices/:id/actuate-elevation
  *

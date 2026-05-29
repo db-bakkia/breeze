@@ -2,7 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import { EventEmitter } from 'events';
 import type { AddressInfo } from 'net';
-import { safeFetch, isPrivateIp, SsrfBlockedError, __setLookupForTests } from './urlSafety';
+import {
+  safeFetch,
+  isPrivateIp,
+  isRfc1918OrUla,
+  isAlwaysBlockedIp,
+  SsrfBlockedError,
+  __setLookupForTests
+} from './urlSafety';
 
 describe('isPrivateIp', () => {
   it('classifies IPv4 loopback/private/link-local as private', () => {
@@ -34,15 +41,85 @@ describe('isPrivateIp', () => {
     expect(isPrivateIp('ff02::1')).toBe(true);
   });
 
-  it('unwraps IPv4-mapped IPv6', () => {
+  it('unwraps IPv4-mapped IPv6 (dotted-decimal form)', () => {
     expect(isPrivateIp('::ffff:127.0.0.1')).toBe(true);
     expect(isPrivateIp('::ffff:10.0.0.1')).toBe(true);
     expect(isPrivateIp('::ffff:8.8.8.8')).toBe(false);
   });
 
+  it('unwraps IPv4-mapped IPv6 (hex-pair form) — metadata bypass guard', () => {
+    // ::ffff:a9fe:a9fe == 169.254.169.254 (cloud metadata)
+    expect(isPrivateIp('::ffff:a9fe:a9fe')).toBe(true);
+    expect(isPrivateIp('::FFFF:A9FE:A9FE')).toBe(true); // uppercase
+    // ::ffff:a00:1 == 10.0.0.1 (RFC1918)
+    expect(isPrivateIp('::ffff:a00:1')).toBe(true);
+    // ::ffff:0808:0808 == 8.8.8.8 (public) — must NOT be flagged private
+    expect(isPrivateIp('::ffff:0808:0808')).toBe(false);
+    expect(isPrivateIp('::ffff:808:808')).toBe(false);
+  });
+
   it('classifies public IPv6 as not private', () => {
     expect(isPrivateIp('2001:4860:4860::8888')).toBe(false);
     expect(isPrivateIp('2606:4700:4700::1111')).toBe(false);
+  });
+});
+
+describe('isRfc1918OrUla', () => {
+  it('is true only for RFC1918 IPv4 + ULA IPv6', () => {
+    expect(isRfc1918OrUla('10.0.0.5')).toBe(true);
+    expect(isRfc1918OrUla('192.168.1.1')).toBe(true);
+    expect(isRfc1918OrUla('172.16.0.1')).toBe(true);
+    expect(isRfc1918OrUla('172.31.255.254')).toBe(true);
+    expect(isRfc1918OrUla('fd12::1')).toBe(true);
+    expect(isRfc1918OrUla('fc00::1')).toBe(true);
+    expect(isRfc1918OrUla('::ffff:10.0.0.1')).toBe(true);
+    // hex-pair mapped form of 10.0.0.1
+    expect(isRfc1918OrUla('::ffff:a00:1')).toBe(true);
+    // uppercase mapped form (Bug 2: case-sensitivity)
+    expect(isRfc1918OrUla('::FFFF:10.0.0.1')).toBe(true);
+  });
+
+  it('is false for embedded metadata in a mapped IPv6 (always-blocked even though "mapped")', () => {
+    // ::ffff:a9fe:a9fe == 169.254.169.254 (metadata) — not RFC1918, stays blocked
+    expect(isRfc1918OrUla('::ffff:a9fe:a9fe')).toBe(false);
+    expect(isRfc1918OrUla('::ffff:169.254.169.254')).toBe(false);
+  });
+
+  it('is false for loopback/link-local/metadata/CGNAT/multicast/public', () => {
+    expect(isRfc1918OrUla('127.0.0.1')).toBe(false);
+    expect(isRfc1918OrUla('169.254.169.254')).toBe(false); // cloud metadata
+    expect(isRfc1918OrUla('100.64.0.1')).toBe(false); // CGNAT
+    expect(isRfc1918OrUla('0.0.0.0')).toBe(false);
+    expect(isRfc1918OrUla('224.0.0.1')).toBe(false); // multicast
+    expect(isRfc1918OrUla('fe80::1')).toBe(false); // link-local
+    expect(isRfc1918OrUla('::1')).toBe(false); // loopback
+    expect(isRfc1918OrUla('8.8.8.8')).toBe(false); // public
+    expect(isRfc1918OrUla('172.15.0.1')).toBe(false); // just outside 172.16/12
+    expect(isRfc1918OrUla('172.32.0.1')).toBe(false);
+  });
+});
+
+describe('isAlwaysBlockedIp', () => {
+  it('blocks metadata/loopback/link-local/CGNAT even though they are private', () => {
+    expect(isAlwaysBlockedIp('169.254.169.254')).toBe(true); // cloud metadata
+    expect(isAlwaysBlockedIp('127.0.0.1')).toBe(true);
+    expect(isAlwaysBlockedIp('100.64.0.1')).toBe(true); // CGNAT
+    expect(isAlwaysBlockedIp('fe80::1')).toBe(true); // link-local
+    expect(isAlwaysBlockedIp('::1')).toBe(true);
+    expect(isAlwaysBlockedIp('0.0.0.0')).toBe(true);
+    expect(isAlwaysBlockedIp('224.0.0.1')).toBe(true);
+  });
+
+  it('allows RFC1918/ULA appliance addresses (these are opt-in reachable)', () => {
+    expect(isAlwaysBlockedIp('10.0.0.5')).toBe(false);
+    expect(isAlwaysBlockedIp('192.168.1.1')).toBe(false);
+    expect(isAlwaysBlockedIp('172.16.0.1')).toBe(false);
+    expect(isAlwaysBlockedIp('fd12::1')).toBe(false);
+  });
+
+  it('allows public IPs', () => {
+    expect(isAlwaysBlockedIp('8.8.8.8')).toBe(false);
+    expect(isAlwaysBlockedIp('1.1.1.1')).toBe(false);
   });
 });
 
@@ -68,6 +145,26 @@ describe('safeFetch — SSRF policy', () => {
       SsrfBlockedError
     );
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('rejects literal IPv4-mapped IPv6 hex-form metadata without DNS (strict)', async () => {
+    const spy = vi.fn();
+    __setLookupForTests(async (...args) => {
+      spy(...args);
+      return [{ address: '8.8.8.8', family: 4 }];
+    });
+    // [::ffff:a9fe:a9fe] == 169.254.169.254 cloud metadata
+    await expect(safeFetch('http://[::ffff:a9fe:a9fe]/latest/meta-data')).rejects.toBeInstanceOf(
+      SsrfBlockedError
+    );
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('rejects literal IPv4-mapped IPv6 hex-form metadata even with allowPrivateNetwork', async () => {
+    // metadata is always blocked, even under the on-prem opt-in
+    await expect(
+      safeFetch('http://[::ffff:a9fe:a9fe]/latest/meta-data', { allowPrivateNetwork: true })
+    ).rejects.toBeInstanceOf(SsrfBlockedError);
   });
 
   it('rejects unsupported schemes', async () => {

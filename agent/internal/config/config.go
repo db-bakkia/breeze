@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -262,6 +263,11 @@ func Load(cfgFile string) (*Config, error) {
 		if err := sv.ReadInConfig(); err != nil {
 			return nil, fmt.Errorf("reading secrets file: %w", err)
 		}
+		// IMPORTANT: this read-back is a hardcoded list and CANNOT be driven by
+		// isSecretYAMLKey (there's no generic config-key -> struct-field mapping
+		// at this layer). When you add a new secret field, update BOTH
+		// isSecretYAMLKey (so it gets stripped to secrets.yaml) AND this block
+		// (so it gets read back) — otherwise the field is silently lost on load.
 		if v := sv.GetString("auth_token"); v != "" {
 			cfg.AuthToken = v
 		}
@@ -279,6 +285,15 @@ func Load(cfgFile string) (*Config, error) {
 		}
 		if v := sv.GetString("mtls_cert_expires"); v != "" {
 			cfg.MtlsCertExpires = v
+		}
+		// Companion: backup S3 credentials migrate to secrets.yaml via
+		// isSecretYAMLKey; read them back so BackupS3AccessKey/BackupS3SecretKey
+		// are populated after Load (otherwise backup config silently breaks).
+		if v := sv.GetString("backup_s3_access_key"); v != "" {
+			cfg.BackupS3AccessKey = v
+		}
+		if v := sv.GetString("backup_s3_secret_key"); v != "" {
+			cfg.BackupS3SecretKey = v
 		}
 	}
 
@@ -429,7 +444,12 @@ func SaveTo(cfg *Config, cfgFile string) error {
 	if err != nil {
 		return fmt.Errorf("marshaling agent config: %w", err)
 	}
-	cfgYAML = stripSecretsFromAgentConfig(cfgYAML)
+	// Fail closed: if stripping secrets errors, abort BEFORE writing the
+	// world-readable agent.yaml so the unstripped buffer can never leak to it.
+	cfgYAML, err = stripSecretsFromAgentConfig(cfgYAML)
+	if err != nil {
+		return fmt.Errorf("writing agent config: %w", err)
+	}
 	// agent.yaml is world-readable (0644) so the Breeze Helper, running as the
 	// logged-in user, can read it. It carries only the helper-scoped token;
 	// full tokens and mTLS keys are written to root-only secrets.yaml below.
@@ -463,6 +483,16 @@ func SaveTo(cfg *Config, cfgFile string) error {
 	sv.Set("mtls_cert_pem", cfg.MtlsCertPEM)
 	sv.Set("mtls_key_pem", cfg.MtlsKeyPEM)
 	sv.Set("mtls_cert_expires", cfg.MtlsCertExpires)
+	// Backup S3 credentials are caught by isSecretYAMLKey (suffix _access_key /
+	// _secret_key) and stripped from agent.yaml; persist them here so they
+	// survive a round-trip through SaveTo → Load. Only write non-empty values
+	// for the same reason as auth_token above.
+	if cfg.BackupS3AccessKey != "" {
+		sv.Set("backup_s3_access_key", cfg.BackupS3AccessKey)
+	}
+	if cfg.BackupS3SecretKey != "" {
+		sv.Set("backup_s3_secret_key", cfg.BackupS3SecretKey)
+	}
 
 	// Same atomic-write pattern for the secrets file (0600).
 	secretsYAML, err := yaml.Marshal(sv.AllSettings())
@@ -473,33 +503,46 @@ func SaveTo(cfg *Config, cfgFile string) error {
 		return fmt.Errorf("writing secrets file: %w", err)
 	}
 
-	// Defense-in-depth: ensure secrets permissions are correct.
+	// Enforce secrets permissions — this is fatal, not just a warning, because
+	// leaving secrets.yaml world-readable after a failed chmod is a security
+	// breach. agent.yaml/dir chmod failures remain warn-only (see the log.Warn
+	// calls right after the agent.yaml write above).
 	if err := enforceSecretFilePermissions(secretsPath); err != nil {
-		log.Warn("failed to enforce secrets file permissions", "error", err.Error())
+		return fmt.Errorf("enforcing secrets file permissions on %s: %w", secretsPath, err)
 	}
 
 	return nil
 }
 
-func stripSecretsFromAgentConfig(data []byte) []byte {
+// stripSecretsFromAgentConfig removes secret-bearing keys (see isSecretYAMLKey)
+// from a serialized agent.yaml buffer. It MUST fail closed: on any
+// unmarshal/marshal error it returns a wrapped error and NO data, never the
+// original unstripped buffer. The caller (SaveTo) aborts before writing the
+// world-readable (0644) agent.yaml, so secrets can never leak to that file.
+// stripMarshalForTests lets tests force the post-delete marshal step to fail so
+// the fail-closed SaveTo abort path (secrets never written to agent.yaml) can be
+// exercised. nil in production => real yaml.Marshal.
+var stripMarshalForTests func(any) ([]byte, error)
+
+func stripSecretsFromAgentConfig(data []byte) ([]byte, error) {
 	var values map[string]any
 	if err := yaml.Unmarshal(data, &values); err != nil {
-		return data
+		return nil, fmt.Errorf("stripping secrets from agent config (unmarshal): %w", err)
 	}
-	for _, key := range []string{
-		"auth_token",
-		"watchdog_auth_token",
-		"mtls_cert_pem",
-		"mtls_key_pem",
-		"mtls_cert_expires",
-	} {
-		delete(values, key)
+	for key := range values {
+		if isSecretYAMLKey(key) {
+			delete(values, key)
+		}
 	}
-	out, err := yaml.Marshal(values)
+	marshal := yaml.Marshal
+	if stripMarshalForTests != nil {
+		marshal = stripMarshalForTests
+	}
+	out, err := marshal(values)
 	if err != nil {
-		return data
+		return nil, fmt.Errorf("stripping secrets from agent config (marshal): %w", err)
 	}
-	return out
+	return out, nil
 }
 
 // atomicWriteFile writes data to path durably: it creates path+".partial" in
@@ -562,13 +605,36 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-func isSecretConfigKey(key string) bool {
-	switch key {
-	case "auth_token", "watchdog_auth_token", "mtls_cert_pem", "mtls_key_pem", "mtls_cert_expires":
-		return true
-	default:
+// secretKeyAllowedInAgentYAML lists keys that look secret by suffix rules but
+// must remain in agent.yaml. The Breeze Helper ("Breeze Assist") runs as the
+// logged-in user and reads agent.yaml directly; it needs helper_auth_token.
+var secretKeyAllowedInAgentYAML = map[string]bool{
+	"helper_auth_token": true,
+}
+
+// isSecretYAMLKey reports whether key should be kept out of agent.yaml (i.e.
+// written only to secrets.yaml). It uses a suffix-based predicate so future
+// secret keys like backup_s3_access_key are caught automatically without
+// requiring an explicit list update. Keys in secretKeyAllowedInAgentYAML are
+// explicitly exempted regardless of suffix.
+func isSecretYAMLKey(key string) bool {
+	if secretKeyAllowedInAgentYAML[key] {
 		return false
 	}
+	switch key {
+	case "auth_token", "watchdog_auth_token",
+		"mtls_cert_pem", "mtls_key_pem", "mtls_cert_expires":
+		return true
+	}
+	return strings.HasSuffix(key, "_token") ||
+		strings.HasSuffix(key, "_secret_key") ||
+		strings.HasSuffix(key, "_access_key") ||
+		strings.HasSuffix(key, "_secret") ||
+		strings.HasSuffix(key, "_password")
+}
+
+func isSecretConfigKey(key string) bool {
+	return isSecretYAMLKey(key)
 }
 
 // GetDataDir returns the platform-specific data directory for the agent
@@ -624,17 +690,9 @@ func migrateInlineSecretsToSecretFile(cfgPath string) error {
 		return err
 	}
 
-	secretKeys := []string{
-		"auth_token",
-		"watchdog_auth_token",
-		"mtls_cert_pem",
-		"mtls_key_pem",
-		"mtls_cert_expires",
-	}
-
 	hasInlineSecretKeys := false
-	for _, key := range secretKeys {
-		if _, ok := cfgValues[key]; ok {
+	for key := range cfgValues {
+		if isSecretYAMLKey(key) {
 			hasInlineSecretKeys = true
 			break
 		}
@@ -655,11 +713,13 @@ func migrateInlineSecretsToSecretFile(cfgPath string) error {
 		return err
 	}
 
-	for _, key := range secretKeys {
-		if isEmptyYAMLValue(secretValues[key]) && !isEmptyYAMLValue(cfgValues[key]) {
-			secretValues[key] = cfgValues[key]
+	for key := range cfgValues {
+		if isSecretYAMLKey(key) {
+			if isEmptyYAMLValue(secretValues[key]) && !isEmptyYAMLValue(cfgValues[key]) {
+				secretValues[key] = cfgValues[key]
+			}
+			delete(cfgValues, key)
 		}
-		delete(cfgValues, key)
 	}
 
 	if secretFileExists || len(secretValues) > 0 {
