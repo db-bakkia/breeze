@@ -363,10 +363,29 @@ async function processExecuteDevice(data: ExecutePatchJobDeviceData): Promise<un
     ringId?: string | null;
     categoryRules?: unknown[];
     autoApprove?: unknown;
+    sources?: unknown;
   };
   const targets = patchJob.targets as {
     deployment?: { rebootPolicy?: string };
   };
+
+  // Distinguish absent sources (legacy job → no filtering) from present-but-malformed
+  // (shape drift / bad write): malformed also falls back to no filtering, but loudly —
+  // silently widening install scope is the dangerous direction.
+  let jobSources: string[] | undefined;
+  if (patchesConfig?.sources !== undefined) {
+    const raw = patchesConfig.sources;
+    const strings = Array.isArray(raw) ? raw.filter((s): s is string => typeof s === 'string') : [];
+    if (!Array.isArray(raw) || strings.length !== raw.length || strings.length === 0) {
+      console.warn(
+        `[PatchJobExecutor] Job ${patchJobId} has malformed patches.sources; ignoring source filter:`,
+        JSON.stringify(raw)
+      );
+      jobSources = undefined;
+    } else {
+      jobSources = strings;
+    }
+  }
 
   const ringConfig: RingConfig = {
     ringId: patchesConfig?.ringId ?? null,
@@ -375,6 +394,7 @@ async function processExecuteDevice(data: ExecutePatchJobDeviceData): Promise<un
       : []) as RingConfig['categoryRules'],
     autoApprove: patchesConfig?.autoApprove ?? {},
     deferralDays: 0,
+    sources: jobSources,
   };
 
   // If we have a ringId, load deferralDays from the ring

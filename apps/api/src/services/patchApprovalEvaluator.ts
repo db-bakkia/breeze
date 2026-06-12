@@ -25,6 +25,8 @@ export interface RingConfig {
   categoryRules: CategoryRule[];
   autoApprove: unknown;
   deferralDays: number;
+  /** Policy-level source selections ('os', 'third_party', ...). Absent/empty = no filtering (legacy). */
+  sources?: string[];
 }
 
 export interface ApprovedPatch {
@@ -36,6 +38,49 @@ export interface ApprovedPatch {
   severity: string | null;
   requiresReboot: boolean;
   approvalReason: 'manual' | 'category_rule' | 'legacy_auto_approve';
+}
+
+// ============================================
+// Policy-source → patch-source mapping
+// ============================================
+
+/** patches.source values that count as OS updates. Keep in sync with patchSourceEnum (db/schema/patches.ts). */
+const OS_PATCH_SOURCES = ['microsoft', 'apple', 'linux'] as const;
+/** patches.source values that count as third-party application updates. Keep in sync with patchSourceEnum (db/schema/patches.ts). */
+const THIRD_PARTY_PATCH_SOURCES = ['third_party', 'custom'] as const;
+
+/**
+ * Expand policy-level source selections ('os', 'third_party', ...) into the
+ * set of patches.source values they allow. Returns null when no filtering
+ * should be applied (legacy jobs created before sources were enforced).
+ * 'firmware' / 'drivers' have no patch provider yet and expand to nothing.
+ */
+export function buildAllowedPatchSources(sources: string[] | undefined): Set<string> | null {
+  if (!sources || sources.length === 0) return null;
+
+  const allowed = new Set<string>();
+  for (const source of sources) {
+    switch (source) {
+      case 'os':
+        for (const s of OS_PATCH_SOURCES) allowed.add(s);
+        break;
+      case 'third_party':
+        for (const s of THIRD_PARTY_PATCH_SOURCES) allowed.add(s);
+        break;
+      case 'microsoft':
+      case 'apple':
+      case 'linux':
+      case 'custom':
+        allowed.add(source);
+        break;
+      // 'firmware', 'drivers': no patch provider exists — expand to nothing
+    }
+  }
+  return allowed;
+}
+
+export function isThirdPartyPatchSource(source: string | null | undefined): boolean {
+  return (THIRD_PARTY_PATCH_SOURCES as readonly string[]).includes(source ?? '');
 }
 
 // ============================================
@@ -60,6 +105,7 @@ export async function resolveApprovedPatchesForDevice(
       severity: patches.severity,
       releaseDate: patches.releaseDate,
       requiresReboot: patches.requiresReboot,
+      source: patches.source,
     })
     .from(devicePatches)
     .innerJoin(patches, eq(devicePatches.patchId, patches.id))
@@ -72,8 +118,21 @@ export async function resolveApprovedPatchesForDevice(
 
   if (pendingPatches.length === 0) return [];
 
+  // Apply policy-level source filtering ('os' vs 'third_party' etc.).
+  const allowedSources = buildAllowedPatchSources(ringConfig.sources);
+  const candidatePatches = allowedSources
+    ? pendingPatches.filter((p) => allowedSources.has(p.source))
+    : pendingPatches;
+
+  if (candidatePatches.length === 0) {
+    console.warn(
+      `[PatchApproval] device ${deviceId}: all ${pendingPatches.length} pending patches excluded by policy sources [${(ringConfig.sources ?? []).join(', ')}]`
+    );
+    return [];
+  }
+
   // 2. Load manual approvals for this org (optionally scoped to ring)
-  const patchIds = pendingPatches.map((p) => p.patchId);
+  const patchIds = candidatePatches.map((p) => p.patchId);
   const manualApprovals = await db
     .select({
       patchId: patchApprovals.patchId,
@@ -113,7 +172,7 @@ export async function resolveApprovedPatchesForDevice(
   const now = new Date();
   const approved: ApprovedPatch[] = [];
 
-  for (const patch of pendingPatches) {
+  for (const patch of candidatePatches) {
     const reason = evaluatePatchApproval(
       patch,
       ringConfig,
@@ -149,6 +208,7 @@ interface PatchCandidate {
   category: string | null;
   severity: string | null;
   releaseDate: string | null;
+  source: string;
 }
 
 function evaluatePatchApproval(
@@ -169,29 +229,33 @@ function evaluatePatchApproval(
     return null;
   }
 
-  // Priority 2: Category rule
-  if (patch.category) {
-    const rule = categoryRuleMap.get(patch.category.toLowerCase());
-    if (rule && rule.autoApprove) {
-      // Check severity filter
-      if (rule.severityFilter && rule.severityFilter.length > 0 && patch.severity) {
-        if (!rule.severityFilter.includes(patch.severity)) {
-          return null; // Severity not in allowed list
-        }
+  // Priority 2: Category rule.
+  // 'third_party_app' is a virtual category — agents report inconsistent
+  // category strings for app updates (application/homebrew/homebrew-cask/...),
+  // so it matches by patch source instead. An exact category rule wins.
+  let rule = patch.category ? categoryRuleMap.get(patch.category.toLowerCase()) : undefined;
+  if (!rule && isThirdPartyPatchSource(patch.source)) {
+    rule = categoryRuleMap.get('third_party_app');
+  }
+  if (rule && rule.autoApprove) {
+    // Check severity filter
+    if (rule.severityFilter && rule.severityFilter.length > 0 && patch.severity) {
+      if (!rule.severityFilter.includes(patch.severity)) {
+        return null; // Severity not in allowed list
       }
-
-      // Check deferral period
-      const deferralDays = rule.deferralDaysOverride ?? ringConfig.deferralDays;
-      if (deferralDays > 0 && patch.releaseDate) {
-        const releaseDate = new Date(patch.releaseDate);
-        const deferralEnd = new Date(releaseDate.getTime() + deferralDays * 24 * 60 * 60 * 1000);
-        if (deferralEnd > now) {
-          return null; // Still in deferral period
-        }
-      }
-
-      return 'category_rule';
     }
+
+    // Check deferral period
+    const deferralDays = rule.deferralDaysOverride ?? ringConfig.deferralDays;
+    if (deferralDays > 0 && patch.releaseDate) {
+      const releaseDate = new Date(patch.releaseDate);
+      const deferralEnd = new Date(releaseDate.getTime() + deferralDays * 24 * 60 * 60 * 1000);
+      if (deferralEnd > now) {
+        return null; // Still in deferral period
+      }
+    }
+
+    return 'category_rule';
   }
 
   // Priority 3: Legacy ring-level auto-approve
