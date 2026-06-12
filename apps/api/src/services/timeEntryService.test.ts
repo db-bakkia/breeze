@@ -84,7 +84,12 @@ vi.mock('../db/schema', () => ({
   tickets: { id: 'id', partnerId: 'partnerId', orgId: 'orgId', categoryId: 'categoryId', internalNumber: 'internalNumber', subject: 'subject' },
   ticketCategories: { id: 'id', partnerId: 'partnerId', defaultBillable: 'defaultBillable', defaultHourlyRate: 'defaultHourlyRate' },
   organizations: { id: 'id', partnerId: 'partnerId', name: 'name' },
-  users: { id: 'id', name: 'name' }
+  users: { id: 'id', name: 'name' },
+  ticketComments: {
+    id: 'id', ticketId: 'ticketId', userId: 'userId', authorName: 'authorName',
+    authorType: 'authorType', commentType: 'commentType', content: 'content',
+    isPublic: 'isPublic', oldValue: 'oldValue', newValue: 'newValue', createdAt: 'createdAt'
+  }
 }));
 
 import {
@@ -488,5 +493,104 @@ describe('query helpers', () => {
     expect(rows.map((r) => r.amount)).not.toContain('NaN');
     expect(consoleSpy).toHaveBeenCalledTimes(2);
     consoleSpy.mockRestore();
+  });
+});
+
+describe('time_entry feed comments', () => {
+  it('createTimeEntry with ticketId inserts a ticketComments row (logged, billable suffix)', async () => {
+    dbMocks.selectResults.push([{ id: 't-1', partnerId: 'p-1', orgId: 'o-1', categoryId: null }]);
+    dbMocks.insertResult = [{ id: 'te-1', partnerId: 'p-1', ticketId: 't-1', userId: 'u-1', durationMinutes: 45, isBillable: true }];
+    await createTimeEntry(
+      { ticketId: 't-1', startedAt: new Date('2026-06-11T09:00:00Z'), endedAt: new Date('2026-06-11T09:45:00Z'), isBillable: true },
+      ACTOR
+    );
+    // Two inserts: first is timeEntries, second is ticketComments
+    expect(dbMocks.insertedValues).toHaveLength(2);
+    const commentVals = dbMocks.insertedValues[1]!;
+    expect(commentVals.ticketId).toBe('t-1');
+    expect(commentVals.commentType).toBe('time_entry');
+    expect(commentVals.isPublic).toBe(false);
+    expect(commentVals.authorType).toBe('internal');
+    expect(String(commentVals.content)).toContain('logged 45m');
+    expect(String(commentVals.content)).toContain('(billable)');
+  });
+
+  it('createTimeEntry WITHOUT ticketId does not insert a ticketComments row', async () => {
+    dbMocks.insertResult = [{ id: 'te-2', partnerId: 'p-1', ticketId: null, userId: 'u-1', durationMinutes: 60, isBillable: false }];
+    await createTimeEntry(
+      { startedAt: new Date('2026-06-11T09:00:00Z'), endedAt: new Date('2026-06-11T10:00:00Z') },
+      ACTOR
+    );
+    // Only the timeEntries insert — no ticketComments insert
+    expect(dbMocks.insertedValues).toHaveLength(1);
+  });
+
+  it('stopTimer on a ticket-linked entry inserts a ticketComments row with logged wording and correct duration', async () => {
+    // stopRunningEntry does an UPDATE; the returned row has ticketId + durationMinutes
+    dbMocks.updateResult = [{ id: 'te-3', partnerId: 'p-1', ticketId: 't-2', userId: 'u-1', durationMinutes: 90, isBillable: false }];
+    await stopTimer({}, ACTOR);
+    const commentVals = dbMocks.insertedValues[0]!;
+    expect(commentVals.ticketId).toBe('t-2');
+    expect(commentVals.commentType).toBe('time_entry');
+    expect(commentVals.isPublic).toBe(false);
+    expect(String(commentVals.content)).toContain('logged 1h 30m');
+    expect(String(commentVals.content)).not.toContain('(billable)');
+  });
+
+  it('startTimer auto-stops a ticket-linked entry and inserts a ticketComments row for the stopped entry', async () => {
+    // updateResult = the auto-stopped previous entry (ticket-linked, 60m, billable)
+    dbMocks.updateResult = [{ id: 'te-prev', partnerId: 'p-1', ticketId: 't-X', userId: 'u-1', durationMinutes: 60, isBillable: true }];
+    // insertResult = the new running timer (no ticket, non-billable)
+    dbMocks.insertResult = [{ id: 'te-next', partnerId: 'p-1', ticketId: null, userId: 'u-1', endedAt: null, durationMinutes: null, isBillable: false }];
+    await startTimer({ description: 'next task' }, ACTOR);
+    // Two inserts: first is ticketComments for the auto-stopped entry, second is the new timeEntries row
+    const feedComment = dbMocks.insertedValues.find((v) => v.commentType === 'time_entry');
+    expect(feedComment).toBeDefined();
+    expect(feedComment!.ticketId).toBe('t-X');
+    expect(feedComment!.commentType).toBe('time_entry');
+    expect(feedComment!.isPublic).toBe(false);
+    expect(String(feedComment!.content)).toContain('1h');
+    expect(String(feedComment!.content)).toContain('(billable)');
+  });
+
+  it('deleteTimeEntry on a ticket-linked entry inserts a ticketComments row with removed wording', async () => {
+    dbMocks.selectResults.push([{ id: 'te-4', userId: 'u-1', isApproved: false, partnerId: 'p-1', ticketId: 't-3', durationMinutes: 45 }]);
+    await deleteTimeEntry('te-4', ACTOR);
+    const commentVals = dbMocks.insertedValues[0]!;
+    expect(commentVals.ticketId).toBe('t-3');
+    expect(commentVals.commentType).toBe('time_entry');
+    expect(commentVals.isPublic).toBe(false);
+    expect(String(commentVals.content)).toContain('removed a');
+    expect(String(commentVals.content)).toContain('45m');
+  });
+
+  it('deleting a running (null-duration) entry produces "removed a time entry" with no duration', async () => {
+    dbMocks.selectResults.push([{ id: 'te-5', userId: 'u-1', isApproved: false, partnerId: 'p-1', ticketId: 't-4', durationMinutes: null }]);
+    await deleteTimeEntry('te-5', ACTOR);
+    const commentVals = dbMocks.insertedValues[0]!;
+    expect(String(commentVals.content)).toBe('Tess removed a time entry');
+  });
+
+  it('a feed-comment insert failure does not reject createTimeEntry and the event is still emitted', async () => {
+    dbMocks.selectResults.push([{ id: 't-1', partnerId: 'p-1', orgId: 'o-1', categoryId: null }]);
+    dbMocks.insertResult = [{ id: 'te-6', partnerId: 'p-1', ticketId: 't-1', userId: 'u-1', durationMinutes: 30, isBillable: false }];
+    // Make the ticketComments insert fail (first insert uses insertResult, second rejects).
+    // We push null for the timeEntries returning() call (null is falsy → falls through to insertResult),
+    // then the actual error for the ticketComments returning() call.
+    const feedError = new Error('DB connection lost');
+    dbMocks.insertErrors.push(null as unknown as Error, feedError);
+    // createTimeEntry must not reject even though the feed comment insert fails;
+    // if it rejects this line itself will throw and the test fails appropriately.
+    const entry = await createTimeEntry(
+      { ticketId: 't-1', startedAt: new Date('2026-06-11T09:00:00Z'), endedAt: new Date('2026-06-11T09:30:00Z') },
+      ACTOR
+    );
+    expect(entry.id).toBe('te-6');
+    // Event must still be emitted after the swallowed feed-comment failure
+    expect(emitMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'time_entry.created' }));
+    // Both values() calls were made (timeEntries + ticketComments) confirming the insert was attempted
+    expect(dbMocks.insertedValues).toHaveLength(2);
+    expect(dbMocks.insertedValues[0]!.billingStatus).toBe('not_billed'); // timeEntries row
+    expect(dbMocks.insertedValues[1]!.commentType).toBe('time_entry'); // ticketComments row attempted
   });
 });
