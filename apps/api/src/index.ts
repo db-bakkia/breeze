@@ -145,6 +145,10 @@ import {
   initializeAuditChainVerifyWorker,
   shutdownAuditChainVerifyWorker,
 } from './jobs/auditChainVerify';
+import {
+  initializeAuditChainAnchorWorker,
+  shutdownAuditChainAnchorWorker,
+} from './jobs/auditChainAnchor';
 import { initializeTenantErasureWorker, shutdownTenantErasureWorker } from './jobs/tenantErasure';
 import { initializeDiscoveryWorker, shutdownDiscoveryWorker } from './jobs/discoveryWorker';
 import { initializeNetworkBaselineWorker, shutdownNetworkBaselineWorker } from './jobs/networkBaselineWorker';
@@ -1040,6 +1044,7 @@ async function initializeWorkers(): Promise<void> {
     ['oauthCleanup', initializeOauthCleanupWorker],
     ['auditRetention', initializeAuditRetentionWorker],
     ['auditChainVerify', initializeAuditChainVerifyWorker],
+    ['auditChainAnchor', initializeAuditChainAnchorWorker],
     ['tenantErasure', initializeTenantErasureWorker],
     ['playbookRetention', initializePlaybookRetention],
     ['discoveryWorker', initializeDiscoveryWorker],
@@ -1210,6 +1215,7 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
     shutdownOauthCleanupWorker,
     shutdownAuditRetentionWorker,
     shutdownAuditChainVerifyWorker,
+    shutdownAuditChainAnchorWorker,
     shutdownTenantErasureWorker,
     shutdownPlaybookRetention,
     shutdownSecurityPostureWorker,
