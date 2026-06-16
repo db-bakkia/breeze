@@ -135,6 +135,7 @@ import { googleRoutes } from './routes/google';
 import { m365Routes } from './routes/m365';
 import { drRoutes } from './routes/dr';
 import { adminRoutes } from './routes/admin';
+import { internalSyntheticRoutes } from './routes/internal/synthetic';
 import { bootstrapPlatformAdmins } from './services/platformAdminBootstrap';
 import { captureException, flushSentry, initSentry } from './services/sentry';
 import { partnerGuard } from './middleware/partnerGuard';
@@ -663,6 +664,7 @@ api.use('*', async (c, next) => {
   if (path.startsWith('/api/v1/users/me')) return next();
   if (path === '/api/v1/partner/me' || path.startsWith('/api/v1/partner/me/')) return next();
   if (path.startsWith('/api/v1/agents/')) return next();
+  if (path.startsWith('/api/v1/internal/synthetic/')) return next();   // synthetic test router — self-gated (token + canary latch)
   return partnerGuard(c, next);
 });
 
@@ -826,6 +828,7 @@ api.route('/groups', groupRoutes);
 api.route('/device-groups', groupRoutes);
 api.route('/integrations', integrationRoutes);
 api.route('/partner', partnerRoutes);
+api.route('/internal/synthetic', internalSyntheticRoutes);
 api.route('/partner/known-guests', networkKnownGuestsRoutes);
 api.route('/tags', tagRoutes);
 api.route('/custom-fields', customFieldRoutes);
