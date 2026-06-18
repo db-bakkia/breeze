@@ -122,6 +122,7 @@ import { mountInviteLandingRoutes } from './modules/mcpInvites';
 import { devPushRoutes } from './routes/devPush';
 import { helperRoutes } from './routes/helper';
 import { playbookRoutes } from './routes/playbooks';
+import { remediationSuggestionRoutes } from './routes/remediationSuggestions';
 import { seedBuiltInPlaybooks } from './services/builtInPlaybooks';
 import { seedDefaultAuditBaselines } from './services/auditBaselineService';
 import { changesRoutes } from './routes/changes';
@@ -152,6 +153,14 @@ import { initializeNotificationDispatcher, shutdownNotificationDispatcher } from
 import { initializeEventLogRetention, shutdownEventLogRetention } from './jobs/eventLogRetention';
 import { initializeAgentLogRetention, shutdownAgentLogRetention } from './jobs/agentLogRetention';
 import { initializeLogCorrelationWorker, shutdownLogCorrelationWorker } from './jobs/logCorrelation';
+import { initializeAlertCorrelationWorker, shutdownAlertCorrelationWorker } from './jobs/alertCorrelation';
+import { initializeMetricRollupsWorker, shutdownMetricRollupsWorker } from './jobs/metricRollups';
+import {
+  initializeMetricRollupMaintenanceWorker,
+  shutdownMetricRollupMaintenanceWorker,
+} from './jobs/metricRollupMaintenance';
+import { initializeMetricAnomaliesWorker, shutdownMetricAnomaliesWorker } from './jobs/metricAnomalies';
+import { initializeMlOutputRetention, shutdownMlOutputRetention } from './jobs/mlOutputRetention';
 import { initializeIPHistoryRetention, shutdownIPHistoryRetention } from './jobs/ipHistoryRetention';
 import { initializeChangeLogRetention, shutdownChangeLogRetention } from './jobs/changeLogRetention';
 import { initializeOauthCleanupWorker, shutdownOauthCleanupWorker } from './jobs/oauthCleanup';
@@ -663,7 +672,7 @@ async function resolveFallbackOrgId(c: Context, path: string): Promise<string | 
 api.use('*', async (c, next) => {
   const path = c.req.path;
   if (path.startsWith('/api/v1/auth')) return next();
-  if (path === '/api/v1/config' || path.startsWith('/api/v1/config/')) return next();
+  if (path === '/api/v1/config' || path === '/api/v1/config/') return next();
   if (path.startsWith('/api/v1/users/me')) return next();
   if (path === '/api/v1/partner/me' || path.startsWith('/api/v1/partner/me/')) return next();
   if (path.startsWith('/api/v1/agents/')) return next();
@@ -855,6 +864,7 @@ api.route('/mcp', mcpServerRoutes);
 api.route('/dev', devPushRoutes);
 api.route('/helper', helperRoutes);
 api.route('/playbooks', playbookRoutes);
+api.route('/remediation-suggestions', remediationSuggestionRoutes);
 api.route('/changes', changesRoutes);
 api.route('/dns-security', dnsSecurityRoutes);
 api.route('/s1', sentinelOneRoutes);
@@ -1054,6 +1064,11 @@ async function initializeWorkers(): Promise<void> {
 
   const workers: Array<[string, () => Promise<void>]> = [
     ['alertWorkers', initializeAlertWorkers],
+    ['alertCorrelationWorker', initializeAlertCorrelationWorker],
+    ['metricRollupsWorker', initializeMetricRollupsWorker],
+    ['metricRollupMaintenance', initializeMetricRollupMaintenanceWorker],
+    ['metricAnomaliesWorker', initializeMetricAnomaliesWorker],
+    ['mlOutputRetention', initializeMlOutputRetention],
     ['offlineDetector', initializeOfflineDetector],
     ['notificationDispatcher', initializeNotificationDispatcher],
     ['webhookDelivery', initializeWebhookDeliveryWorker],
@@ -1247,6 +1262,7 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
     shutdownLogCorrelationWorker,
     shutdownAgentLogRetention,
     shutdownIPHistoryRetention,
+    shutdownMlOutputRetention,
     shutdownReliabilityRetention,
     shutdownProcessSampleRetention,
     shutdownChangeLogRetention,
@@ -1268,6 +1284,10 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
     shutdownPolicyEvaluationWorker,
     shutdownNotificationDispatcher,
     shutdownOfflineDetector,
+    shutdownMetricAnomaliesWorker,
+    shutdownMetricRollupMaintenanceWorker,
+    shutdownMetricRollupsWorker,
+    shutdownAlertCorrelationWorker,
     shutdownAlertWorkers,
     shutdownStaleCommandReaper,
     shutdownPamJobs,
