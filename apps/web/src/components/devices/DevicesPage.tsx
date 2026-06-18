@@ -250,6 +250,7 @@ export default function DevicesPage() {
           siteId: (d.siteId ?? '') as string,
           siteName: '', // Will be resolved from sites
           agentVersion: (d.agentVersion ?? '') as string,
+          watchdogVersion: (d.watchdogVersion ?? null) as string | null,
           tags: (d.tags ?? []) as string[],
           deviceRole: d.deviceRole as DeviceRole | undefined,
           deviceRoleSource: d.deviceRoleSource as string | undefined,
@@ -291,6 +292,7 @@ export default function DevicesPage() {
         siteId: (d.siteId ?? '') as string,
         siteName: '',
         agentVersion: '',
+        watchdogVersion: null,
         tags: (d.tags ?? []) as string[],
         manufacturer: (d.manufacturer ?? null) as string | null,
         model: (d.model ?? null) as string | null,
@@ -403,6 +405,11 @@ export default function DevicesPage() {
             : d
         ));
       }
+      // NOTE: no live watchdogVersion handler — the heartbeat path only
+      // publishes `device.updated` with fields:['agentVersion'], never
+      // 'watchdogVersion'. The watchdog version refreshes on the next list
+      // fetch / device-detail load. Wire a producer in the watchdog heartbeat
+      // branch before adding a consumer here.
     } else if (type === 'device.enrolled' || type === 'device.decommissioned') {
       fetchDevices();
     }
