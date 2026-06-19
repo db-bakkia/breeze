@@ -177,8 +177,25 @@ vi.mock('../db/schema', () => ({
     id: 'metricAnomalies.id',
     orgId: 'metricAnomalies.orgId',
     deviceId: 'metricAnomalies.deviceId',
+    sourceTable: 'metricAnomalies.sourceTable',
+    metricName: 'metricAnomalies.metricName',
+    anomalyType: 'metricAnomalies.anomalyType',
+    bucketSeconds: 'metricAnomalies.bucketSeconds',
+    windowStart: 'metricAnomalies.windowStart',
     status: 'metricAnomalies.status',
     detectedAt: 'metricAnomalies.detectedAt'
+  },
+  metricAnomalyCandidates: {
+    id: 'metricAnomalyCandidates.id',
+    orgId: 'metricAnomalyCandidates.orgId',
+    deviceId: 'metricAnomalyCandidates.deviceId',
+    sourceTable: 'metricAnomalyCandidates.sourceTable',
+    metricName: 'metricAnomalyCandidates.metricName',
+    anomalyType: 'metricAnomalyCandidates.anomalyType',
+    bucketSeconds: 'metricAnomalyCandidates.bucketSeconds',
+    windowStart: 'metricAnomalyCandidates.windowStart',
+    detectedAt: 'metricAnomalyCandidates.detectedAt',
+    modelVersion: 'metricAnomalyCandidates.modelVersion'
   },
   mlFeedbackEvents: {
     orgId: 'mlFeedbackEvents.orgId',
@@ -527,6 +544,94 @@ describe('analytics routes', () => {
       expect(body.total).toBe(0);
       expect(body.rates).toEqual({ dismissRate: 0, promoteRate: 0, resolveRate: 0 });
       expect(body.feedback.total).toBe(0);
+    });
+
+    it('includes v1 shadow comparison only when requested', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 4 },
+        { status: 'dismissed', count: 1 },
+      ]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 1 },
+      ]);
+      mockSelectOnce([{ totalCandidates: 6 }]);
+      mockSelectOnce([{ overlapWithV0: 3 }]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 2 },
+        { eventType: 'anomaly.promoted', count: 1 },
+      ]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d&includeV1=true', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(5);
+      expect(body.v1Shadow).toMatchObject({
+        modelVersion: 'metric-anomaly-v1-seasonal-robust',
+        totalCandidates: 6,
+        overlapWithV0: 3,
+        v1Only: 3,
+        v0Only: 2,
+        labeledOutcomes: { total: 3, dismissed: 2, promoted: 1, resolved: 0 },
+      });
+      expect(body.v1Shadow.rates.overlapRate).toBe(0.5);
+      expect(body.v1Shadow.rates.v0OnlyRate).toBe(0.4);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(5);
+    });
+
+    it('omits v1 shadow and issues no candidate queries by default', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 4 },
+        { status: 'dismissed', count: 1 },
+      ]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 1 },
+      ]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(5);
+      expect(body.v1Shadow).toBeUndefined();
+      // Only the status + feedback selects run — the 3 candidate queries must stay dark.
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports an all-zero v1 shadow block when there are no candidates', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 2 },
+      ]);
+      mockSelectOnce([]);
+      mockSelectOnce([{ totalCandidates: 0 }]);
+      mockSelectOnce([{ overlapWithV0: 0 }]);
+      mockSelectOnce([]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d&includeV1=true', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(2);
+      expect(body.v1Shadow).toMatchObject({
+        totalCandidates: 0,
+        overlapWithV0: 0,
+        v1Only: 0,
+        v0Only: 2,
+        labeledOutcomes: { total: 0, dismissed: 0, promoted: 0, resolved: 0 },
+      });
+      // With no candidates but live v0 anomalies, every v0 row is v0-only.
+      expect(body.v1Shadow.rates.v0OnlyRate).toBe(1);
+      expect(body.v1Shadow.rates.overlapRate).toBe(0);
+      expect(body.v1Shadow.rates.v1OnlyRate).toBe(0);
     });
   });
 
