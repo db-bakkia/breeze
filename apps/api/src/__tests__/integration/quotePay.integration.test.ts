@@ -11,15 +11,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { withDbAccessContext, withSystemDbAccessContext, type DbAccessContext } from '../../db';
 import { createPartner, createOrganization } from './db-utils';
 
-const { sessionsCreateMock, getConnectionMock } = vi.hoisted(() => ({
-  sessionsCreateMock: vi.fn(),
-  getConnectionMock: vi.fn(),
+// #1610 replaced Stripe Connect with the per-partner API-key model: createInvoicePayLink
+// now resolves the partner's client via getPartnerStripeClient (./partnerStripe) and maps a
+// NO_STRIPE_KEY PartnerStripeError to STRIPE_NOT_CONNECTED. Mock that seam — the old
+// stripeClient/stripeConnectService modules are no longer on the pay path.
+const { sessionsCreateMock, getPartnerStripeClientMock, PartnerStripeError } = vi.hoisted(() => {
+  class PartnerStripeError extends Error {
+    readonly status: number;
+    constructor(message: string, readonly code: 'NO_STRIPE_KEY' | 'INVALID_STRIPE_KEY' | 'STRIPE_KEY_UNREADABLE') {
+      super(message);
+      this.name = 'PartnerStripeError';
+      this.status = code === 'NO_STRIPE_KEY' ? 409 : code === 'INVALID_STRIPE_KEY' ? 400 : 500;
+    }
+  }
+  return { sessionsCreateMock: vi.fn(), getPartnerStripeClientMock: vi.fn(), PartnerStripeError };
+});
+vi.mock('../../services/partnerStripe', () => ({
+  getPartnerStripeClient: getPartnerStripeClientMock,
+  PartnerStripeError,
 }));
-vi.mock('../../services/stripeClient', () => ({
-  getStripe: () => ({ checkout: { sessions: { create: sessionsCreateMock } } }),
-  getConnectedStripeOptions: (acct: string) => ({ stripeAccount: acct }),
-}));
-vi.mock('../../services/stripeConnectService', () => ({ getConnection: getConnectionMock }));
 
 import { createQuote, addManualLine } from '../../services/quoteService';
 import { sendQuote } from '../../services/quoteLifecycle';
@@ -37,7 +47,7 @@ async function seed() { return withSystemDbAccessContext(async () => { const par
 describe('createQuotePayLink (breeze_app, real DB)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getConnectionMock.mockResolvedValue({ partnerId: 'p', stripeAccountId: 'acct_test', status: 'connected' });
+    getPartnerStripeClientMock.mockResolvedValue({ stripe: { checkout: { sessions: { create: sessionsCreateMock } } }, stripeAccountId: 'acct_test' });
     sessionsCreateMock.mockResolvedValue({ id: 'cs_quote_1', url: 'https://checkout.stripe.com/c/pay/quote', payment_intent: null });
   });
 
@@ -77,6 +87,23 @@ describe('createQuotePayLink (breeze_app, real DB)', () => {
 
     await expect(withSystemDbAccessContext(() => createQuotePayLink(created.id, iActor(org.id, partner.id))))
       .rejects.toMatchObject({ status: 409, code: 'NOT_PAYABLE' });
+    expect(sessionsCreateMock).not.toHaveBeenCalled();
+  });
+
+  runDb('a corrupt/undecryptable partner key → STRIPE_INIT_FAILED (500), not the 409 "connect Stripe" lie', async () => {
+    // #1610 forks the connection lookup: NO_STRIPE_KEY is a benign 409, but a
+    // STRIPE_KEY_UNREADABLE (decrypt fault / KEK rotated away) must surface as an
+    // internal 500 — not "connect Stripe first". Guards invoiceCheckout.ts:42-50.
+    getPartnerStripeClientMock.mockRejectedValue(new PartnerStripeError('stored key unreadable', 'STRIPE_KEY_UNREADABLE'));
+    const { partner, org } = await seed();
+    const ctx = ctxFor(org.id, partner.id);
+    const created = await withDbAccessContext(ctx, () => createQuote({ orgId: org.id, currencyCode: 'USD' }, qActor(org.id, partner.id)));
+    await withDbAccessContext(ctx, () => addManualLine(created.id, { sourceType: 'manual', description: 'Setup', quantity: 1, unitPrice: 250, taxable: false, customerVisible: true, recurrence: 'one_time' } as any, qActor(org.id, partner.id)));
+    await withDbAccessContext(ctx, () => sendQuote(created.id, qActor(org.id, partner.id)));
+    await withDbAccessContext(ctx, () => acceptQuote({ quoteId: created.id, signerName: 'Jane' }));
+
+    await expect(withSystemDbAccessContext(() => createQuotePayLink(created.id, iActor(org.id, partner.id))))
+      .rejects.toMatchObject({ status: 500, code: 'STRIPE_INIT_FAILED' });
     expect(sessionsCreateMock).not.toHaveBeenCalled();
   });
 });

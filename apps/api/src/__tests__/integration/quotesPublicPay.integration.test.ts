@@ -15,15 +15,25 @@ import { quotes, quoteLines } from '../../db/schema/quotes';
 import { createPartner, createOrganization } from './db-utils';
 import { createQuoteAcceptToken } from '../../services/quoteAcceptToken';
 
-const { sessionsCreateMock, getConnectionMock } = vi.hoisted(() => ({
-  sessionsCreateMock: vi.fn(),
-  getConnectionMock: vi.fn(),
+// #1610 replaced Stripe Connect with the per-partner API-key model: createInvoicePayLink
+// now resolves the partner's client via getPartnerStripeClient (./partnerStripe) and maps a
+// NO_STRIPE_KEY PartnerStripeError to STRIPE_NOT_CONNECTED. Mock that seam — the old
+// stripeClient/stripeConnectService modules are no longer on the pay path.
+const { sessionsCreateMock, getPartnerStripeClientMock, PartnerStripeError } = vi.hoisted(() => {
+  class PartnerStripeError extends Error {
+    readonly status: number;
+    constructor(message: string, readonly code: 'NO_STRIPE_KEY' | 'INVALID_STRIPE_KEY' | 'STRIPE_KEY_UNREADABLE') {
+      super(message);
+      this.name = 'PartnerStripeError';
+      this.status = code === 'NO_STRIPE_KEY' ? 409 : code === 'INVALID_STRIPE_KEY' ? 400 : 500;
+    }
+  }
+  return { sessionsCreateMock: vi.fn(), getPartnerStripeClientMock: vi.fn(), PartnerStripeError };
+});
+vi.mock('../../services/partnerStripe', () => ({
+  getPartnerStripeClient: getPartnerStripeClientMock,
+  PartnerStripeError,
 }));
-vi.mock('../../services/stripeClient', () => ({
-  getStripe: () => ({ checkout: { sessions: { create: sessionsCreateMock } } }),
-  getConnectedStripeOptions: (acct: string) => ({ stripeAccount: acct }),
-}));
-vi.mock('../../services/stripeConnectService', () => ({ getConnection: getConnectionMock }));
 
 import { quotesPublicRoutes } from '../../routes/quotesPublic';
 
@@ -47,7 +57,7 @@ async function seedSentQuote() {
 describe('public accept → pay', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getConnectionMock.mockResolvedValue({ partnerId: 'p', stripeAccountId: 'acct_test', status: 'connected' });
+    getPartnerStripeClientMock.mockResolvedValue({ stripe: { checkout: { sessions: { create: sessionsCreateMock } } }, stripeAccountId: 'acct_test' });
     sessionsCreateMock.mockResolvedValue({ id: 'cs_pub_1', url: 'https://checkout.stripe.com/c/pay/pub', payment_intent: null });
   });
 
@@ -63,7 +73,7 @@ describe('public accept → pay', () => {
   });
 
   runDb('accept still succeeds (payUrl null, NOT deferred) when Stripe is not connected', async () => {
-    getConnectionMock.mockResolvedValue(null);
+    getPartnerStripeClientMock.mockRejectedValue(new PartnerStripeError('no key configured', 'NO_STRIPE_KEY'));
     const { quoteId, token } = await seedSentQuote();
     const res = await postJson(`/quotes/public/${token}/accept`, { signerName: 'Pat Prospect' });
     expect(res.status).toBe(200);
@@ -90,5 +100,24 @@ describe('public accept → pay', () => {
     expect(body.data.payDeferred).toBe(true);
     const [q] = await withSystemDbAccessContext(() => db.select({ status: quotes.status }).from(quotes).where(eq(quotes.id, quoteId)));
     expect(q!.status).toBe('converted'); // accept committed despite the Stripe failure
+  });
+
+  // A corrupt/undecryptable partner key (STRIPE_KEY_UNREADABLE → 500 STRIPE_INIT_FAILED)
+  // is NOT a benign no-pay outcome like STRIPE_NOT_CONNECTED — the route must flag it
+  // payDeferred so a silently-lost CTA is observable. Guards the benign-vs-deferred
+  // discrimination at quotesPublic.ts:106-107 (the two PartnerStripeError codes must
+  // NOT be collapsed into one bucket).
+  runDb('accept still succeeds (payUrl null, payDeferred true) when the stored Stripe key is unreadable', async () => {
+    getPartnerStripeClientMock.mockRejectedValue(new PartnerStripeError('stored key unreadable', 'STRIPE_KEY_UNREADABLE'));
+    const { quoteId, token } = await seedSentQuote();
+    const res = await postJson(`/quotes/public/${token}/accept`, { signerName: 'Pat Prospect' });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: { status: string; payUrl: string | null; payDeferred?: boolean } };
+    expect(body.data.status).toBe('converted');
+    expect(body.data.payUrl).toBeNull();
+    expect(body.data.payDeferred).toBe(true);
+    expect(sessionsCreateMock).not.toHaveBeenCalled();
+    const [q] = await withSystemDbAccessContext(() => db.select({ status: quotes.status }).from(quotes).where(eq(quotes.id, quoteId)));
+    expect(q!.status).toBe('converted');
   });
 });
