@@ -8,6 +8,7 @@ import {
   deviceMetrics,
   agentVersions,
   agentLogs,
+  onedriveDeviceState,
 } from '../../db/schema';
 import { writeAuditEvent } from '../../services/auditEvents';
 import { heartbeatSchema } from './schemas';
@@ -21,7 +22,9 @@ import {
   buildMonitoringConfigUpdate,
   buildHelperConfigUpdate,
   buildPamConfigUpdate,
+  buildOnedriveHelperConfigUpdate,
   getOrgAgentUpdatePolicy,
+  type OnedriveConfigUpdate,
 } from './helpers';
 import { shouldSendAgentUpgrade } from './agentUpdatePolicy';
 import { processDeviceIPHistoryUpdate } from '../../services/deviceIpHistory';
@@ -458,6 +461,41 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
   }
 
+  if (data.onedriveDeviceState) {
+    const s = data.onedriveDeviceState;
+    try {
+      await db.insert(onedriveDeviceState).values({
+        deviceId: device.id,
+        orgId: device.orgId,
+        signedIn: s.signedIn,
+        oneDriveVersion: s.oneDriveVersion ?? null,
+        filesOnDemandOn: s.filesOnDemandOn,
+        kfmFolderStates: s.kfmFolderStates,
+        mountedLibraries: s.mountedLibraries,
+        entitledLibraries: s.entitledLibraries,
+        driftEntries: s.driftEntries,
+        lastReportedAt: new Date(),
+        updatedAt: new Date(),
+      }).onConflictDoUpdate({
+        target: onedriveDeviceState.deviceId,
+        set: {
+          signedIn: s.signedIn,
+          oneDriveVersion: s.oneDriveVersion ?? null,
+          filesOnDemandOn: s.filesOnDemandOn,
+          kfmFolderStates: s.kfmFolderStates,
+          mountedLibraries: s.mountedLibraries,
+          entitledLibraries: s.entitledLibraries,
+          driftEntries: s.driftEntries,
+          lastReportedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+    } catch (err) {
+      console.error(`[agents] failed to upsert onedrive device state for ${agentId}:`, err);
+      captureException(err);
+    }
+  }
+
   const commands = await claimPendingCommandsForDevice(device.id, 10);
 
   let configUpdate: PolicyProbeConfigUpdate | null = null;
@@ -632,14 +670,25 @@ if (latestHelper) {
     captureException(err);
   }
 
+  let onedriveSettings: OnedriveConfigUpdate | null = null;
+  try {
+    onedriveSettings = await buildOnedriveHelperConfigUpdate(device.id);
+  } catch (err) {
+    console.error(`[agents] failed to build onedrive_helper config update for ${agentId}:`, err);
+    captureException(err);
+  }
+
   let mergedConfigUpdate: Record<string, unknown> | null = null;
-  if (configUpdate || eventLogSettings || monitoringSettings) {
+  if (configUpdate || eventLogSettings || monitoringSettings || onedriveSettings) {
     mergedConfigUpdate = { ...(configUpdate ?? {}) };
     if (eventLogSettings) {
       mergedConfigUpdate.event_log_settings = eventLogSettings;
     }
     if (monitoringSettings) {
       mergedConfigUpdate.monitoring_settings = monitoringSettings;
+    }
+    if (onedriveSettings) {
+      mergedConfigUpdate.onedrive_helper_settings = onedriveSettings;
     }
   }
 
