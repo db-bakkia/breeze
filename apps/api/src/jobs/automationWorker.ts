@@ -30,6 +30,8 @@ import {
 } from '../services/featureConfigResolver';
 import { getBullMQConnection, isRedisAvailable } from '../services/redis';
 import { isReusableState } from '../services/bullmqUtils';
+import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
+import { automationQueueJobDataSchema, type AutomationAssignmentLevel, type AutomationQueueJobData } from './queueSchemas';
 import { attachWorkerObservability } from './workerObservability';
 
 const { db } = dbModule;
@@ -57,66 +59,19 @@ function logMissingTableWarning(worker: string, feature: string): void {
 const AUTOMATION_QUEUE = 'automations';
 const SCHEDULE_SCAN_INTERVAL_MS = 60 * 1000;
 
-interface ScanSchedulesJobData {
-  type: 'scan-schedules';
-  scanAt: string;
-}
+// Per-variant types are derived from the Zod union so they can never drift from
+// the schema validated at the dequeue boundary (see queueSchemas.ts:233-241).
+type TriggerScheduleJobData = Extract<AutomationQueueJobData, { type: 'trigger-schedule' }>;
+type TriggerEventJobData = Extract<AutomationQueueJobData, { type: 'trigger-event' }>;
+type ExecuteRunJobData = Extract<AutomationQueueJobData, { type: 'execute-run' }>;
+type TriggerConfigPolicyScheduleJobData = Extract<AutomationQueueJobData, { type: 'trigger-config-policy-schedule' }>;
+type ExecuteConfigPolicyRunJobData = Extract<AutomationQueueJobData, { type: 'execute-config-policy-run' }>;
 
-interface TriggerScheduleJobData {
-  type: 'trigger-schedule';
-  automationId: string;
-  slotKey: string;
-  scanAt: string;
-}
+// Shared shape for a resolved (level, targetId) assignment pair, matching the
+// element type of the schema's assignmentTargets[] array.
+type ConfigPolicyAssignmentTarget = { level: AutomationAssignmentLevel; targetId: string };
 
-interface TriggerEventJobData {
-  type: 'trigger-event';
-  automationId: string;
-  eventType: string;
-  eventId?: string;
-  eventPayload?: Record<string, unknown>;
-  eventTimestamp: string;
-}
-
-interface ExecuteRunJobData {
-  type: 'execute-run';
-  runId: string;
-  targetDeviceIds?: string[];
-}
-
-interface ConfigPolicyAssignmentTarget {
-  level: string;
-  targetId: string;
-}
-
-interface TriggerConfigPolicyScheduleJobData {
-  type: 'trigger-config-policy-schedule';
-  configPolicyAutomationId: string;
-  configPolicyAutomationName: string;
-  assignmentTargets?: ConfigPolicyAssignmentTarget[];
-  // Backward compatibility with already-enqueued jobs from older payloads.
-  assignmentLevel?: string;
-  assignmentTargetId?: string;
-  policyId: string;
-  policyName: string;
-  slotKey: string;
-  scanAt: string;
-}
-
-interface ExecuteConfigPolicyRunJobData {
-  type: 'execute-config-policy-run';
-  configPolicyAutomationId: string;
-  targetDeviceIds: string[];
-  triggeredBy: string;
-}
-
-type AutomationJobData =
-  | ScanSchedulesJobData
-  | TriggerScheduleJobData
-  | TriggerEventJobData
-  | ExecuteRunJobData
-  | TriggerConfigPolicyScheduleJobData
-  | ExecuteConfigPolicyRunJobData;
+type AutomationJobData = AutomationQueueJobData;
 
 let automationQueue: Queue<AutomationJobData> | null = null;
 let automationWorker: Worker<AutomationJobData> | null = null;
@@ -711,21 +666,26 @@ function createAutomationWorker(): Worker<AutomationJobData> {
     AUTOMATION_QUEUE,
     async (job: Job<AutomationJobData>) => {
       return runWithSystemDbAccess(async () => {
-        switch (job.data.type) {
+        const data = parseQueueJobData(AUTOMATION_QUEUE, job, automationQueueJobDataSchema);
+        switch (data.type) {
           case 'scan-schedules':
-            return processScanSchedules(job.data.scanAt);
+            assertQueueJobName(AUTOMATION_QUEUE, job, 'scan-schedules');
+            return processScanSchedules(data.scanAt);
           case 'trigger-schedule':
-            return processTriggerSchedule(job.data);
+            assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-schedule');
+            return processTriggerSchedule(data);
           case 'trigger-event':
-            return processTriggerEvent(job.data);
+            assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-event');
+            return processTriggerEvent(data);
           case 'execute-run':
-            return processExecuteRun(job.data);
+            assertQueueJobName(AUTOMATION_QUEUE, job, 'execute-run');
+            return processExecuteRun(data);
           case 'trigger-config-policy-schedule':
-            return processTriggerConfigPolicySchedule(job.data);
+            assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-config-policy-schedule');
+            return processTriggerConfigPolicySchedule(data);
           case 'execute-config-policy-run':
-            return processExecuteConfigPolicyRun(job.data);
-          default:
-            throw new Error(`Unknown automation job type: ${(job.data as { type: string }).type}`);
+            assertQueueJobName(AUTOMATION_QUEUE, job, 'execute-config-policy-run');
+            return processExecuteConfigPolicyRun(data);
         }
       });
     },
