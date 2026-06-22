@@ -73,6 +73,7 @@ const TARGET_GLOBS = [
   'src/components/billing/quotes/QuotesPage.tsx',
   'src/components/billing/quotes/QuoteEditor.tsx',
   'src/components/alerts/CorrelatedAlertGroups.tsx',
+  'src/components/integrations/SecurityIntegration.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
