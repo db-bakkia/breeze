@@ -115,6 +115,10 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'devices', action: 'delete', description: 'Delete/decommission devices' },
   { resource: 'devices', action: 'execute', description: 'Execute commands on devices' },
 
+  // Network topology (discovery topology view + saved layout)
+  { resource: 'topology', action: 'read', description: 'View network topology and saved layout' },
+  { resource: 'topology', action: 'write', description: 'Persist topology node layout (drag-to-save)' },
+
   // Scripts
   { resource: 'scripts', action: 'read', description: 'View scripts' },
   { resource: 'scripts', action: 'write', description: 'Create and edit scripts' },
@@ -209,6 +213,7 @@ export const SYSTEM_ROLES = [
       'tickets:read',
       'reports:read', 'reports:write',
       'sites:read',
+      'topology:read',
       'organizations:read'
     ]
   },
@@ -261,6 +266,7 @@ export const SYSTEM_ROLES = [
       'reports:read', 'reports:write', 'reports:delete', 'reports:export',
       'users:read', 'users:write', 'users:delete', 'users:invite',
       'sites:read', 'sites:write', 'sites:delete',
+      'topology:read', 'topology:write',
       'remote:access',
       'audit:read'
     ]
@@ -276,6 +282,7 @@ export const SYSTEM_ROLES = [
       'tickets:read',
       'reports:read', 'reports:write',
       'sites:read',
+      'topology:read', 'topology:write',
       'remote:access'
     ]
   },
@@ -289,7 +296,8 @@ export const SYSTEM_ROLES = [
       'alerts:read',
       'tickets:read',
       'reports:read',
-      'sites:read'
+      'sites:read',
+      'topology:read'
     ]
   }
 ];
