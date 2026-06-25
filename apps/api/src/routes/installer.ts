@@ -156,18 +156,19 @@ async function redeemBootstrapToken(c: Context, token: string) {
     // If the consume UPDATE loses a race, we'll DELETE this row below.
     const rawChildKey = generateChildEnrollmentKey();
     const childKeyHash = hashEnrollmentKey(rawChildKey);
+    const platformLabel = row.installerPlatform === "windows" ? "win-installer" : "mac-installer";
     const [childKey] = await db
       .insert(enrollmentKeys)
       .values({
         orgId: row.orgId,
         siteId: row.siteId,
-        name: `${parent.name} (mac-installer ${hashTokenForLog(token)})`,
+        name: `${parent.name} (${platformLabel} ${hashTokenForLog(token)})`,
         key: childKeyHash,
         keySecretHash: parent.keySecretHash,
         maxUsage: row.maxUsage,
         expiresAt: childExpiresAt,
         createdBy: row.createdBy,
-        installerPlatform: "macos",
+        installerPlatform: row.installerPlatform ?? "macos",
       })
       .returning();
 
