@@ -16,6 +16,26 @@ import {
 import { eq, and, desc, sql, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
+import { decryptForColumn } from './secretCrypto';
+import { redactUrlForLogs } from './notificationSenders/webhookSender';
+
+// webhooks.url is encrypted at rest and may embed credentials. Decrypt for
+// display then strip userinfo/query/hash so the AI tool never sees a token.
+// Plaintext legacy rows pass through decryptForColumn unchanged.
+function maskWebhookUrl(stored: string): string {
+  let decrypted: string;
+  try {
+    // Legacy plaintext rows pass through decryptForColumn unchanged (no throw).
+    decrypted = decryptForColumn('webhooks', 'url', stored) ?? stored;
+  } catch {
+    // An encrypted value we cannot decrypt (key/AAD mismatch, corruption). Do NOT
+    // fall back to the raw ciphertext: redactUrlForLogs treats `enc:...` as an
+    // opaque URL and would surface the ciphertext blob to the model. Emit a fixed
+    // placeholder instead.
+    return '[encrypted]';
+  }
+  return redactUrlForLogs(decrypted);
+}
 
 type IntegrationHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -104,13 +124,15 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         .orderBy(desc(webhooks.createdAt))
         .limit(limit);
 
+      const maskedRows = rows.map((row) => ({ ...row, url: maskWebhookUrl(row.url) }));
+
       if (!includeDeliveries) {
-        return JSON.stringify({ webhooks: rows, count: rows.length });
+        return JSON.stringify({ webhooks: maskedRows, count: maskedRows.length });
       }
 
       // Fetch last 10 deliveries per webhook
       const webhooksWithDeliveries = await Promise.all(
-        rows.map(async (webhook) => {
+        maskedRows.map(async (webhook) => {
           const deliveries = await db
             .select({
               id: webhookDeliveries.id,
@@ -257,7 +279,7 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         message: `Test delivery queued for webhook "${webhook.name}"`,
         deliveryId: delivery.id,
         webhookId: webhook.id,
-        webhookUrl: webhook.url,
+        webhookUrl: maskWebhookUrl(webhook.url),
         createdAt: delivery.createdAt,
       });
     }),
