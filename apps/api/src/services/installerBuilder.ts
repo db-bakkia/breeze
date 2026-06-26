@@ -392,12 +392,21 @@ export async function probeMacosInstallerApp(): Promise<boolean> {
  * download filename — the Windows analogue of the macOS renamed-app zip. The
  * MSI bytes are never modified, so the Authenticode signature stays intact and
  * every customer shares one file hash (SmartScreen reputation accrues).
+ *
+ * The token is wrapped in PARENTHESES, not square brackets. At install time the
+ * download path travels through MSI's Formatted-field engine (OriginalDatabase
+ * -> SetBootstrapData -> CustomActionData), and a "[...]" substring (brackets
+ * are that engine's property-reference delimiter) gets stripped along the way,
+ * silently dropping the token — agents then log "no bootstrap token present"
+ * and never enroll (observed in #1956). Parens are not special in MSI Formatted
+ * fields, so they survive. The agent parser (installer_filename.go) accepts
+ * both forms; the macOS download carries the token in bootstrap.json instead.
  */
 export function serveWindowsBootstrapMsi(
   c: Context,
   args: { msi: Buffer; token: string; apiHost: string },
 ): Response {
-  const filename = `Breeze Agent [${args.token}@${args.apiHost}].msi`;
+  const filename = `Breeze Agent (${args.token}@${args.apiHost}).msi`;
   c.header('Content-Type', 'application/octet-stream');
   c.header('Content-Disposition', `attachment; filename="${filename}"`);
   c.header('Content-Length', String(args.msi.length));
