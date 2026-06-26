@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useRef, useCallback, useId, type KeyboardEvent, type ReactNode } from 'react';
 import { Activity, Plus, Trash2, Server, Cpu, FileWarning, Bell, ChevronDown, ChevronRight, Settings2 } from 'lucide-react';
 import type { FeatureTabProps } from './types';
 import { FEATURE_META } from './types';
@@ -12,6 +12,13 @@ import { fetchWithAuth } from '../../../stores/auth';
 
 type WatchType = 'service' | 'process';
 type AlertSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+function handleToggleKeyDown(event: KeyboardEvent<HTMLElement>, onToggle: () => void) {
+  if (event.target !== event.currentTarget) return;
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  onToggle();
+}
 
 type WatchEntry = {
   watchType: WatchType;
@@ -240,12 +247,17 @@ function MonitoringSection({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen ?? count > 0);
+  const panelId = useId();
 
   return (
     <div className="rounded-lg border bg-card overflow-hidden">
-      <button
-        type="button"
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        aria-controls={panelId}
         onClick={() => setOpen(!open)}
+        onKeyDown={(event) => handleToggleKeyDown(event, () => setOpen(!open))}
         className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-muted/30 transition"
       >
         {open ? (
@@ -279,10 +291,10 @@ function MonitoringSection({
           <Plus className="h-3.5 w-3.5" />
           {addLabel}
         </button>
-      </button>
+      </div>
 
       {open && (
-        <div className="border-t px-4 py-3">
+        <div id={panelId} className="border-t px-4 py-3">
           {children}
         </div>
       )}
@@ -681,6 +693,7 @@ function WatchCard({
   onRemove: () => void;
   nameInputRef?: React.RefObject<HTMLInputElement | null>;
 }) {
+  const panelId = useId();
   const summaryParts: string[] = [];
   if (watch.alertOnStop) summaryParts.push('alert on stop');
   if (watch.autoRestart) summaryParts.push('auto-restart');
@@ -689,9 +702,13 @@ function WatchCard({
   return (
     <div className="rounded-md border bg-background">
       {/* Header */}
-      <button
-        type="button"
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-controls={panelId}
         onClick={onToggle}
+        onKeyDown={(event) => handleToggleKeyDown(event, onToggle)}
         className="flex w-full items-center gap-3 px-4 py-3 text-left"
       >
         {expanded ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
@@ -722,11 +739,11 @@ function WatchCard({
             <Trash2 className="h-3.5 w-3.5" />
           </button>
         </div>
-      </button>
+      </div>
 
       {/* Expanded form */}
       {expanded && (
-        <div className="border-t px-4 py-3 space-y-4">
+        <div id={panelId} className="border-t px-4 py-3 space-y-4">
           <div className="grid gap-4 sm:grid-cols-3">
             <div>
               <label className="text-xs font-medium text-muted-foreground">Type</label>
@@ -846,12 +863,17 @@ function EventLogAlertCard({
   onRemove: () => void;
   nameInputRef?: React.RefObject<HTMLInputElement | null>;
 }) {
+  const panelId = useId();
   return (
     <div className="rounded-md border bg-background">
       {/* Header */}
-      <button
-        type="button"
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-controls={panelId}
         onClick={onToggle}
+        onKeyDown={(event) => handleToggleKeyDown(event, onToggle)}
         className="flex w-full items-center gap-3 px-4 py-3 text-left"
       >
         {expanded ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
@@ -884,11 +906,11 @@ function EventLogAlertCard({
             <Trash2 className="h-3.5 w-3.5" />
           </button>
         </div>
-      </button>
+      </div>
 
       {/* Expanded form */}
       {expanded && (
-        <div className="border-t px-4 py-3 space-y-4">
+        <div id={panelId} className="border-t px-4 py-3 space-y-4">
           <div className="grid gap-4 sm:grid-cols-3">
             <div>
               <label className="text-xs font-medium text-muted-foreground">Rule Name</label>
@@ -972,12 +994,17 @@ function AlertRuleCard({
   onRemoveCondition: (ci: number) => void;
   nameInputRef?: React.RefObject<HTMLInputElement | null>;
 }) {
+  const panelId = useId();
   return (
     <div className="rounded-md border bg-background">
       {/* Header */}
-      <button
-        type="button"
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-controls={panelId}
         onClick={onToggle}
+        onKeyDown={(event) => handleToggleKeyDown(event, onToggle)}
         className="flex w-full items-center gap-3 px-4 py-3 text-left"
       >
         {expanded ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
@@ -998,11 +1025,11 @@ function AlertRuleCard({
         >
           <Trash2 className="h-3.5 w-3.5" />
         </button>
-      </button>
+      </div>
 
       {/* Expanded form */}
       {expanded && (
-        <div className="border-t px-4 pb-4 pt-3 space-y-4">
+        <div id={panelId} className="border-t px-4 pb-4 pt-3 space-y-4">
           {/* Name */}
           <div>
             <label className="text-xs font-medium text-muted-foreground">Rule Name</label>
