@@ -21,12 +21,14 @@ import Pax8Integration from './Pax8Integration';
 import TdSynnexCatalogPanel from '../settings/TdSynnexCatalogPanel';
 import TdSynnexEcExpressPanel from '../settings/TdSynnexEcExpressPanel';
 import QuickbooksIntegration from './QuickbooksIntegration';
+import StripePaymentsIntegration from './StripePaymentsIntegration';
 import { getJwtClaims } from '../../lib/authScope';
 
 type TabId = 'webhooks' | 'notifications' | 'psa' | 'security' | 'monitoring' | 'identity' | 'distributors' | 'accounting';
 type SecuritySubTab = 'sentinelone' | 'huntress';
 type IdentitySubTab = 'google' | 'm365';
 type DistributorSubTab = 'pax8' | 'tdsynnex' | 'tdsynnex-ec';
+type AccountingSubTab = 'quickbooks' | 'stripe';
 
 const tabs: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: 'webhooks', label: 'Webhooks', icon: Webhook },
@@ -59,6 +61,11 @@ const distributorSubTabs: { id: DistributorSubTab; label: string }[] = [
   { id: 'tdsynnex-ec', label: 'TD SYNNEX Pricing' },
 ];
 
+const accountingSubTabs: { id: AccountingSubTab; label: string }[] = [
+  { id: 'quickbooks', label: 'QuickBooks' },
+  { id: 'stripe', label: 'Payments' },
+];
+
 interface IntegrationsPageProps {
   initialTab?: TabId;
 }
@@ -73,6 +80,7 @@ export default function IntegrationsPage({ initialTab = 'webhooks' }: Integratio
     securitySub?: SecuritySubTab;
     identitySub?: IdentitySubTab;
     distributorSub?: DistributorSubTab;
+    accountingSub?: AccountingSubTab;
   } = (() => {
     if (typeof window === 'undefined') return { tab: initialTab };
     const hash = window.location.hash.replace(/^#/, '');
@@ -80,12 +88,14 @@ export default function IntegrationsPage({ initialTab = 'webhooks' }: Integratio
     if (securitySubTabs.some((s) => s.id === hash)) return { tab: 'security', securitySub: hash as SecuritySubTab };
     if (identitySubTabs.some((s) => s.id === hash)) return { tab: 'identity', identitySub: hash as IdentitySubTab };
     if (distributorSubTabs.some((s) => s.id === hash)) return { tab: 'distributors', distributorSub: hash as DistributorSubTab };
+    if (accountingSubTabs.some((s) => s.id === hash)) return { tab: 'accounting', accountingSub: hash as AccountingSubTab };
     return { tab: initialTab };
   })();
   const [activeTab, setActiveTab] = useState<TabId>(initialFromHash.tab);
   const [securitySubTab, setSecuritySubTab] = useState<SecuritySubTab>(initialFromHash.securitySub ?? 'sentinelone');
   const [identitySubTab, setIdentitySubTab] = useState<IdentitySubTab>(initialFromHash.identitySub ?? 'google');
   const [distributorSubTab, setDistributorSubTab] = useState<DistributorSubTab>(initialFromHash.distributorSub ?? 'pax8');
+  const [accountingSubTab, setAccountingSubTab] = useState<AccountingSubTab>(initialFromHash.accountingSub ?? 'quickbooks');
 
   // Pax8 and TD SYNNEX APIs both enforce requireScope('partner','system'). Gate
   // the Distributors tab on the JWT scope (never on useOrgStore().partners.length,
@@ -198,6 +208,29 @@ export default function IntegrationsPage({ initialTab = 'webhooks' }: Integratio
         </div>
       )}
 
+      {/* Accounting sub-tabs (hidden for org-scope users, who can't use these APIs) */}
+      {activeTab === 'accounting' && !isOrgScoped && (
+        <div className="flex gap-2">
+          {accountingSubTabs.map((sub) => {
+            const isActive = sub.id === accountingSubTab;
+            return (
+              <button
+                key={sub.id}
+                type="button"
+                onClick={() => setAccountingSubTab(sub.id)}
+                className={`rounded-md border px-3 py-1.5 text-sm font-medium transition ${
+                  isActive
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-border bg-background text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {sub.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* Tab content */}
       {activeTab === 'webhooks' && <WebhooksPage />}
       {activeTab === 'notifications' && <CommunicationIntegrations />}
@@ -226,7 +259,8 @@ export default function IntegrationsPage({ initialTab = 'webhooks' }: Integratio
           Accounting integrations are available to partner accounts only.
         </p>
       )}
-      {activeTab === 'accounting' && !isOrgScoped && <QuickbooksIntegration />}
+      {activeTab === 'accounting' && !isOrgScoped && accountingSubTab === 'quickbooks' && <QuickbooksIntegration />}
+      {activeTab === 'accounting' && !isOrgScoped && accountingSubTab === 'stripe' && <StripePaymentsIntegration />}
     </div>
   );
 }
