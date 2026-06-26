@@ -3,6 +3,7 @@ package heartbeat
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ func handleHttpRequest(_ *Heartbeat, cmd Command) tools.CommandResult {
 	targetPortF, _ := cmd.Payload["targetPort"].(float64)
 	targetPort := int(targetPortF)
 	scheme, _ := cmd.Payload["scheme"].(string)
+	skipTLSVerify, _ := cmd.Payload["skipTlsVerify"].(bool)
 	method, _ := cmd.Payload["method"].(string)
 	path, _ := cmd.Payload["path"].(string)
 
@@ -116,13 +118,14 @@ func handleHttpRequest(_ *Heartbeat, cmd Command) tools.CommandResult {
 	defer cancel()
 
 	return fetchAndEncodeHttp(ctx, tunnel.FetchRequest{
-		Scheme:  scheme,
-		Host:    targetHost,
-		Port:    targetPort,
-		Method:  method,
-		Path:    path,
-		Headers: headers,
-		Body:    body,
+		Scheme:        scheme,
+		Host:          targetHost,
+		Port:          targetPort,
+		Method:        method,
+		Path:          path,
+		Headers:       headers,
+		Body:          body,
+		SkipTLSVerify: skipTLSVerify,
 	}, start)
 }
 
@@ -134,9 +137,19 @@ func handleHttpRequest(_ *Heartbeat, cmd Command) tools.CommandResult {
 func fetchAndEncodeHttp(ctx context.Context, req tunnel.FetchRequest, start time.Time) tools.CommandResult {
 	resp, err := tunnel.Fetch(ctx, req, httpProxyTimeout, httpProxyMaxBody)
 	if err != nil {
+		errStr := err.Error()
+		// Defensive guard: normalise the error to the stable API token.
+		// Today Fetch returns ErrTLSCertUntrusted unwrapped, so err.Error() already
+		// equals "tls_cert_untrusted" and the branch is belt-and-suspenders; but if
+		// Fetch ever wraps the sentinel with %w, errors.Is still catches it while a
+		// bare string comparison would not, keeping the stable "tls_cert_untrusted"
+		// token intact for the API's string match.
+		if errors.Is(err, tunnel.ErrTLSCertUntrusted) {
+			errStr = "tls_cert_untrusted"
+		}
 		return tools.CommandResult{
 			Status:     "failed",
-			Error:      err.Error(),
+			Error:      errStr,
 			DurationMs: time.Since(start).Milliseconds(),
 		}
 	}
