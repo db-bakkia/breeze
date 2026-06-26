@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ExternalLink, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { fetchWithAuth } from '../../stores/auth';
+import type { TicketTemplateVars } from '@breeze/shared';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { listCannedResponses, type CannedResponse } from '../../lib/ticketResponseTemplatesApi';
 import { runAction, ActionError } from '../../lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import { loginPathWithNext } from '../../lib/authScope';
@@ -139,6 +141,11 @@ export default function TicketWorkbench({ ticketId, onChanged, onTicketPatched, 
   const [applyingTriage, setApplyingTriage] = useState(false);
   const [rejectingTriage, setRejectingTriage] = useState(false);
 
+  // Partner canned responses for the reply composer. Best-effort: an empty list
+  // (or a failed/forbidden load) simply hides the picker.
+  const [cannedTemplates, setCannedTemplates] = useState<CannedResponse[]>([]);
+  const agentName = useAuthStore((s) => s.user?.name) ?? '';
+
   // null = picker hidden (no USERS_READ etc.); degrade to a label + unassign-only button.
   const [fetchedAssignees, setFetchedAssignees] = useState<Array<{ id: string; name: string | null; email: string }> | null>(null);
   const assigneesProvided = assigneesProp !== undefined;
@@ -176,6 +183,39 @@ export default function TicketWorkbench({ ticketId, onChanged, onTicketPatched, 
   }, [ticketId]);
 
   useEffect(() => { void load(); }, [load]);
+
+  // Load the partner's canned responses once; failure just leaves the picker hidden.
+  useEffect(() => {
+    listCannedResponses()
+      .then(setCannedTemplates)
+      .catch((e) => {
+        // Best-effort: hide the picker on failure, but leave a breadcrumb so a
+        // real load error (403 regression, malformed payload, 500) is
+        // distinguishable from "this partner has no templates".
+        console.debug('[TicketWorkbench] canned responses unavailable; hiding picker', e);
+        setCannedTemplates([]);
+      });
+  }, []);
+
+  // Merge-variable values resolved from the current ticket + signed-in agent,
+  // applied when a canned response is inserted into the composer. `partner_name`
+  // isn't on the ticket payload, so it's left blank client-side (the server fills
+  // it for auto-replies); the picker renders unknown/blank vars as empty.
+  const templateVars = useMemo<TicketTemplateVars>(() => {
+    if (!ticket) return {};
+    const vars: TicketTemplateVars = {
+      ticket_number: ticket.internalNumber ?? '',
+      ticket_subject: ticket.subject ?? '',
+      requester_name: ticket.submitterName ?? '',
+      requester_email: ticket.submitterEmail ?? '',
+      org_name: ticket.orgName ?? '',
+      partner_name: '',
+      agent_name: agentName,
+      current_status: String(ticket.status ?? ''),
+      current_priority: String(ticket.priority ?? ''),
+    };
+    return vars;
+  }, [ticket, agentName]);
 
   useEffect(() => {
     if (!ticket) {
@@ -936,7 +976,12 @@ export default function TicketWorkbench({ ticketId, onChanged, onTicketPatched, 
               canManageComment={(c) => !c.portalUserId}
             />
           </div>
-          <TicketComposer requesterName={ticket.submitterName} onSend={sendComment} />
+          <TicketComposer
+            requesterName={ticket.submitterName}
+            onSend={sendComment}
+            templates={cannedTemplates}
+            templateVars={templateVars}
+          />
         </div>
         {railOpen && (
           <aside className="w-64 shrink-0 overflow-y-auto border-l p-3 text-sm hidden lg:block" data-testid="ticket-workbench-rail">

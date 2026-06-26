@@ -28,11 +28,12 @@
 import { Worker, type Job } from 'bullmq';
 import { eq } from 'drizzle-orm';
 import * as dbModule from '../db';
-import { partners, tickets, userNotifications, users } from '../db/schema';
+import { organizations, partners, tickets, userNotifications, users } from '../db/schema';
 import { getEmailService } from '../services/email';
 import { escapeHtml } from '../services/emailLayout';
 import { buildThreadingHeaders, partnerInboundAddress, ticketThreadAnchor } from '../services/inboundEmail/outboundThreading';
 import { buildAutoresponseEmail } from '../services/inboundEmail/autoresponseTemplate';
+import type { TicketTemplateVars } from '@breeze/shared';
 import { getBullMQConnection } from '../services/redis';
 import { captureException } from '../services/sentry';
 import { TICKET_EVENTS_QUEUE, type TicketEvent } from '../services/ticketEvents';
@@ -189,8 +190,10 @@ async function collectRequesterEmail(
 /**
  * One-time autoresponse acknowledgement (spec §5). The autoresponder gate
  * (inboundEmail/autoresponder.ts) already applied loop-prevention + the per-sender
- * cap before emitting; here we just compose + send. The body is the hardcoded v1
- * template (PR4 swaps it). Loop hygiene: stamp Auto-Submitted: auto-replied and set
+ * cap before emitting; here we just compose + send. The body is the partner's
+ * customized auto-reply template when set (settings.ticketing.inbound.autoresponse
+ * {Subject,Body}, rendered with the ticket's merge variables), otherwise the default
+ * acknowledgement — see buildAutoresponseEmail. Loop hygiene: stamp Auto-Submitted: auto-replied and set
  * the ticket thread anchor as Message-ID so the requester's reply threads. Reply-To
  * is the partner inbound address (self-hosted override honored).
  */
@@ -202,26 +205,50 @@ async function collectAutoresponse(
     throw new Error(`Ticket not found (likely uncommitted): ${event.ticketId}`);
   }
 
-  const tpl = buildAutoresponseEmail({
-    internalNumber: event.payload.internalNumber,
-    subject: event.payload.subject
-  });
-
   let replyTo: string | undefined;
+  let custom: { subject: string | null; body: string | null } | undefined;
+  let partnerName = '';
   if (ticket.partnerId) {
     const partnerRows = await db
-      .select({ slug: partners.slug, settings: partners.settings })
+      .select({ slug: partners.slug, name: partners.name, settings: partners.settings })
       .from(partners)
       .where(eq(partners.id, ticket.partnerId))
       .limit(1);
     const slug = partnerRows[0]?.slug;
-    const override = (partnerRows[0]?.settings as
-      | { ticketing?: { inbound?: { address?: string } } }
-      | undefined)?.ticketing?.inbound?.address;
-    if (slug) replyTo = partnerInboundAddress(slug, override) ?? undefined;
+    partnerName = partnerRows[0]?.name ?? '';
+    const inbound = (partnerRows[0]?.settings as
+      | { ticketing?: { inbound?: { address?: string; autoresponseSubject?: string | null; autoresponseBody?: string | null } } }
+      | undefined)?.ticketing?.inbound;
+    if (slug) replyTo = partnerInboundAddress(slug, inbound?.address) ?? undefined;
+    custom = { subject: inbound?.autoresponseSubject ?? null, body: inbound?.autoresponseBody ?? null };
   }
 
-  // Anchor as Message-ID so the requester's reply threads; Auto-Submitted for loop hygiene.
+  let orgName = '';
+  if (ticket.orgId) {
+    const orgRows = await db
+      .select({ name: organizations.name })
+      .from(organizations)
+      .where(eq(organizations.id, ticket.orgId))
+      .limit(1);
+    orgName = orgRows[0]?.name ?? '';
+  }
+
+  const vars: TicketTemplateVars = {
+    ticket_number: ticket.internalNumber ?? '',
+    ticket_subject: ticket.subject ?? event.payload.subject,
+    requester_name: ticket.submitterName ?? '',
+    requester_email: event.payload.to,
+    org_name: orgName,
+    partner_name: partnerName,
+  };
+
+  const tpl = buildAutoresponseEmail({
+    internalNumber: event.payload.internalNumber,
+    subject: event.payload.subject,
+    custom,
+    vars,
+  });
+
   const headers: Record<string, string> = { 'Auto-Submitted': 'auto-replied' };
   const anchor = ticketThreadAnchor(ticket.id);
   if (anchor) headers['Message-ID'] = anchor;
