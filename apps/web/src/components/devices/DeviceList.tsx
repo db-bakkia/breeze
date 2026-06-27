@@ -244,6 +244,14 @@ const statusSortRank: Record<DeviceStatus, number> = {
   decommissioned: 6,
 };
 
+// Single shared collator for every string sort in this list. `numeric` keeps
+// host-2 < host-10 and agent 0.9.x < 0.10.x; `base` sensitivity folds case and
+// accents so they don't fragment the order. Hoisted to module scope on purpose:
+// constructing an Intl.Collator per comparison is measurably costly on the
+// default landing view at the ~40k-row cap, where the sort runs over the whole
+// union on every render.
+const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
 // One comparable value per column, mirroring what the cell displays.
 // `null` means "renders as a dash" — those rows sort last in BOTH
 // directions so blanks never bury the real data. Strings compare with
@@ -485,7 +493,38 @@ export default function DeviceList({
   );
 
   const sortedDevices = useMemo(() => {
-    if (!sortField) return filteredDevices;
+    // Default ordering for the merged list (#1424, deferred item 1). With no
+    // column actively selected, agent rows arrive hostname-sorted from the
+    // cursor API while network rows arrive last-seen-sorted from the offset
+    // API, and DevicesPage concatenates them as `[...agents, ...network]`. The
+    // raw concatenation therefore renders as two differently-ordered blocks —
+    // the "merged list visibly alternates sort order" defect. Apply one unified
+    // key across the whole union: the same `displayName || hostname` the Device
+    // column sorts on, with `id` as a stable tiebreaker so client-side
+    // pagination is deterministic (a row can't hop pages between renders).
+    if (!sortField) {
+      const byName = sortValue.hostname;
+      // sortValue is typed `string | number | null`; a null/blank name must sort
+      // blanks-last (like the column-sort branch below) rather than become the
+      // string "null"/"" buried among real names. Two blanks tie and fall
+      // through to the id tiebreaker so client-side pagination stays stable.
+      const isBlank = (v: string | number | null) => v == null || String(v).trim() === '';
+      return [...filteredDevices].sort((a, b) => {
+        const av = byName(a);
+        const bv = byName(b);
+        const aBlank = isBlank(av);
+        const bBlank = isBlank(bv);
+        const cmp =
+          aBlank || bBlank
+            ? aBlank === bBlank
+              ? 0
+              : aBlank
+                ? 1
+                : -1
+            : nameCollator.compare(String(av), String(bv));
+        return cmp !== 0 ? cmp : a.id.localeCompare(b.id);
+      });
+    }
     const value = sortValue[sortField];
     const dir = sortDirection === 'desc' ? -1 : 1;
 
@@ -497,7 +536,7 @@ export default function DeviceList({
       const cmp =
         typeof av === 'number' && typeof bv === 'number'
           ? av - bv
-          : String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+          : nameCollator.compare(String(av), String(bv));
       return dir * cmp;
     });
   }, [filteredDevices, sortField, sortDirection]);

@@ -151,4 +151,130 @@ describe('DeviceList — unified agent + network (#1322)', () => {
       expect(within(roleCell).queryByLabelText(/workstation|server|printer/i)).toBeNull();
     });
   });
+
+  // #1424 (deferred item 1): with no column actively selected, the agent arm
+  // arrives hostname-sorted and the network arm last-seen-sorted, and
+  // DevicesPage concatenates them as `[...agents, ...network]`. The raw
+  // concatenation renders as two differently-ordered blocks ("the merged list
+  // visibly alternates sort order"). The default ordering must instead apply one
+  // unified key across the whole union so the classes interleave coherently.
+  describe('unified default sort across the merged union (#1424)', () => {
+    // Primary display name of each rendered row, in DOM order. The hostname
+    // cell renders the primary name (`displayName || hostname`) in a
+    // `font-medium` span and, only when a distinct displayName is present, the
+    // raw hostname in a second muted span — so target the primary span
+    // explicitly rather than every span in the cell.
+    const rowOrder = (container: HTMLElement) =>
+      Array.from(container.querySelectorAll('tbody tr td:nth-child(2) span.font-medium')).map(
+        el => el.textContent,
+      );
+
+    const mkAgent = (id: string, hostname: string): Device => ({ ...agent, id, hostname });
+    const mkNetwork = (id: string, hostname: string): Device => ({ ...networkPrinter, id, hostname });
+
+    it('interleaves agent and network rows by name (numeric collation) instead of as two blocks', () => {
+      // Input arrives as the DevicesPage concatenation: all agents first (in
+      // their server hostname order), then all network rows (in last-seen
+      // order). Names force a coherent default sort to interleave the two
+      // classes, which a raw concatenation never would. `node-2`/`node-10` also
+      // pin the numeric collation: a lexical sort would order `node-10` first.
+      const devices: Device[] = [
+        mkAgent('a1111111-0000-0000-0000-000000000010', 'node-10'),
+        mkAgent('a1111111-0000-0000-0000-000000000001', 'alpha-pc'),
+        mkNetwork('b2222222-0000-0000-0000-000000000002', 'node-2'),
+        mkNetwork('b2222222-0000-0000-0000-000000000003', 'bravo-switch'),
+      ];
+
+      const { container } = render(<DeviceList devices={devices} pageSize={50} networkDevicesEnabled />);
+
+      // agent, network, network, agent — interleaved, and node-2 before node-10.
+      expect(rowOrder(container)).toEqual(['alpha-pc', 'bravo-switch', 'node-2', 'node-10']);
+    });
+
+    it('orders by displayName when present, not the raw hostname', () => {
+      // The default key is `displayName || hostname` (the same the Device column
+      // sorts on). A device whose displayName disagrees with its hostname order
+      // must sort by the displayName the cell actually shows — sorting by raw
+      // hostname would place `zzz-machine` last instead of first.
+      const labeled: Device = {
+        ...agent,
+        id: 'a3333333-0000-0000-0000-000000000001',
+        hostname: 'zzz-machine',
+        displayName: 'aaa-friendly',
+      };
+      const plain = mkAgent('a3333333-0000-0000-0000-000000000002', 'mmm-machine');
+
+      const { container } = render(
+        <DeviceList devices={[plain, labeled]} pageSize={50} networkDevicesEnabled />,
+      );
+
+      expect(rowOrder(container)).toEqual(['aaa-friendly', 'mmm-machine']);
+    });
+
+    it('breaks hostname ties by id so client-side pagination is deterministic', () => {
+      // Two rows share a hostname; without a stable tiebreaker their relative
+      // order would depend on input/merge order and a row could hop pages
+      // between renders. The id tiebreaker pins the order.
+      const devices: Device[] = [
+        mkNetwork('b0000000-0000-0000-0000-0000000000ff', 'shared-host'),
+        mkAgent('a0000000-0000-0000-0000-000000000001', 'shared-host'),
+      ];
+
+      const { container } = render(<DeviceList devices={devices} pageSize={50} networkDevicesEnabled />);
+
+      // Both rows render the same hostname text, so assert order via the class
+      // badge id and confirm reversing the input doesn't change the DOM order.
+      const firstPass = Array.from(container.querySelectorAll('tbody tr')).map(tr =>
+        tr.querySelector('[data-testid$="-class-badge"]')?.getAttribute('data-testid'),
+      );
+      const { container: container2 } = render(
+        <DeviceList devices={[...devices].reverse()} pageSize={50} networkDevicesEnabled />,
+      );
+      const secondPass = Array.from(container2.querySelectorAll('tbody tr')).map(tr =>
+        tr.querySelector('[data-testid$="-class-badge"]')?.getAttribute('data-testid'),
+      );
+
+      // a000... sorts before b000..., regardless of input order.
+      expect(firstPass).toEqual([
+        'device-a0000000-0000-0000-0000-000000000001-class-badge',
+        'device-b0000000-0000-0000-0000-0000000000ff-class-badge',
+      ]);
+      expect(secondPass).toEqual(firstPass);
+    });
+
+    it('applies the unified numeric collation even with zero network rows (agent-only fleet)', () => {
+      // The default sort is unconditional — gated only on "no active column
+      // sort", not on the network arm. So an agent-only fleet (feature flag off,
+      // no network rows) is still re-ordered to the unified key: host-2 sorts
+      // before host-10 rather than keeping the server's lexical order. This is
+      // intentional and deterministic, not a network-only behavior.
+      const devices: Device[] = [
+        mkAgent('a4444444-0000-0000-0000-000000000010', 'host-10'),
+        mkAgent('a4444444-0000-0000-0000-000000000002', 'host-2'),
+        mkAgent('a4444444-0000-0000-0000-000000000001', 'alpha'),
+      ];
+
+      const { container } = render(<DeviceList devices={devices} pageSize={50} />);
+
+      expect(rowOrder(container)).toEqual(['alpha', 'host-2', 'host-10']);
+    });
+
+    it('sorts a row with an empty/whitespace name last (blanks-last)', () => {
+      // `displayName || hostname` can be blank; such a row must sink to the
+      // bottom rather than collate as an empty string among the named rows —
+      // matching the column-sort branch's blanks-last rule.
+      const devices: Device[] = [
+        mkAgent('a5555555-0000-0000-0000-000000000001', '   '),
+        mkAgent('a5555555-0000-0000-0000-000000000002', 'bravo'),
+        mkAgent('a5555555-0000-0000-0000-000000000003', 'alpha'),
+      ];
+
+      const { container } = render(<DeviceList devices={devices} pageSize={50} networkDevicesEnabled />);
+
+      const order = rowOrder(container);
+      expect(order.slice(0, 2)).toEqual(['alpha', 'bravo']);
+      // The blank-named row renders last; its primary name span is whitespace.
+      expect(order[2]?.trim()).toBe('');
+    });
+  });
 });
