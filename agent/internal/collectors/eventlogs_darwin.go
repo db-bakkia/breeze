@@ -3,6 +3,7 @@
 package collectors
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -209,13 +210,21 @@ func (c *EventLogCollector) collectCrashReports(since time.Time) ([]EventLogEntr
 				continue
 			}
 
+			// Classify from the authoritative .ips bug_type (filename/procName are
+			// fallbacks). Real kernel panics are labelled "Kernel panic" so the
+			// reliability classifier counts them as a full device crash; per-app
+			// reports become "Application crash" (the classifier counts those as a
+			// weak, downweighted app_crash); JetsamEvent memory-pressure reports
+			// are labelled distinctly and dropped by the classifier.
+			kind := crashReportKind(name, crashData.bugType, crashData.processName)
+
 			results = append(results, EventLogEntry{
 				Timestamp: info.ModTime().UTC().Format(time.RFC3339),
 				Level:     "error",
 				Category:  "application",
 				Source:    crashData.processName,
 				EventID:   fmt.Sprintf("crash:%s", name),
-				Message:   fmt.Sprintf("Application crash: %s (%s)", crashData.processName, crashData.exceptionType),
+				Message:   fmt.Sprintf("%s: %s (%s)", kind, crashData.processName, crashData.exceptionType),
 				Details: map[string]any{
 					"file":          name,
 					"processName":   crashData.processName,
@@ -233,6 +242,7 @@ type crashInfo struct {
 	processName   string
 	exceptionType string
 	version       string
+	bugType       string // .ips "bug_type": 210 = kernel panic, 298 = JetsamEvent
 }
 
 func parseCrashReport(path string) (*crashInfo, error) {
@@ -251,7 +261,21 @@ func parseCrashReport(path string) (*crashInfo, error) {
 
 	info := &crashInfo{processName: "Unknown"}
 
-	// Try JSON (.ips format)
+	// A modern .ips report is a one-line JSON header (carrying "bug_type")
+	// followed by a separate JSON body (procName / exception). A whole-file
+	// Unmarshal fails on the two values, so peel off the header line first; the
+	// remainder is the body parsed below.
+	if nl := bytes.IndexByte(data, '\n'); nl > 0 {
+		var header struct {
+			BugType string `json:"bug_type"`
+		}
+		if json.Unmarshal(data[:nl], &header) == nil && header.BugType != "" {
+			info.bugType = truncateCollectorString(header.BugType)
+			data = data[nl+1:]
+		}
+	}
+
+	// Try JSON (.ips body, or older single-object format)
 	var ipsData map[string]any
 	if err := json.Unmarshal(data, &ipsData); err == nil {
 		if name, ok := ipsData["procName"].(string); ok {

@@ -545,3 +545,173 @@ func TestClassifyEventLogEntry(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyDarwinEventLogEntry covers the macOS junk that drowned scores
+// (#1907 follow-up): IOKit plugin chatter wrongly counted as hardware, and
+// per-app / JetsamEvent DiagnosticReports wrongly counted as system crashes.
+func TestClassifyDarwinEventLogEntry(t *testing.T) {
+	ts := "2026-01-15T10:00:00Z"
+
+	tests := []struct {
+		name          string
+		entry         EventLogEntry
+		wantCrashes   int
+		wantServices  int
+		wantHangs     int
+		wantHardware  int
+		wantCrashType string
+	}{
+		{
+			name:  "com.apple.iokit.cfplugin error is NOT hardware",
+			entry: EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "com.apple.iokit.cfplugin", EventID: "com.apple.iokit.cfplugin:89", Message: "plugin failed to load"},
+		},
+		{
+			name:  "App Store foundation error is NOT hardware",
+			entry: EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "com.apple.appstorefoundation", EventID: "com.apple.appstorefoundation:15257", Message: "request failed"},
+		},
+		{
+			name:          "Per-app crash counts as weak app_crash",
+			entry:         EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "wdavdaemon", EventID: "crash:wdavdaemon-2026.ips", Message: "Application crash: wdavdaemon (EXC_CRASH)"},
+			wantCrashes:   1,
+			wantCrashType: "app_crash",
+		},
+		{
+			name:  "JetsamEvent memory-pressure report is dropped entirely",
+			entry: EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "Unknown", EventID: "crash:JetsamEvent-2026.ips", Message: "Application crash: Unknown ()"},
+		},
+		{
+			name:          "Kernel panic IS a full device crash",
+			entry:         EventLogEntry{Timestamp: ts, Level: "critical", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "Kernel panic: kernel ()"},
+			wantCrashes:   1,
+			wantCrashType: "kernel_panic",
+		},
+		{
+			name:         "Real disk I/O error IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "com.apple.iokit.IOStorageFamily", EventID: "x:1", Message: "disk0s2: I/O error"},
+			wantHardware: 1,
+		},
+		{
+			name:         "Thermal event IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "critical", Category: "hardware", Source: "com.apple.iokit.thermal", EventID: "x:2", Message: "thermal pressure level critical"},
+			wantHardware: 1,
+		},
+		{
+			name:         "launchd service failure IS a service failure",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "com.apple.launchd", EventID: "x:3", Message: "service com.foo exited with code 1"},
+			wantServices: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetrics()
+			classifyDarwinEventLogEntry(m, tc.entry)
+			if len(m.CrashEvents) != tc.wantCrashes {
+				t.Errorf("crashes: got %d, want %d", len(m.CrashEvents), tc.wantCrashes)
+			}
+			if len(m.ServiceFailures) != tc.wantServices {
+				t.Errorf("services: got %d, want %d", len(m.ServiceFailures), tc.wantServices)
+			}
+			if len(m.AppHangs) != tc.wantHangs {
+				t.Errorf("hangs: got %d, want %d", len(m.AppHangs), tc.wantHangs)
+			}
+			if len(m.HardwareErrors) != tc.wantHardware {
+				t.Errorf("hardware: got %d, want %d", len(m.HardwareErrors), tc.wantHardware)
+			}
+			if tc.wantCrashType != "" {
+				if len(m.CrashEvents) == 0 || m.CrashEvents[0].Type != tc.wantCrashType {
+					t.Errorf("crash type: got %v, want %q", m.CrashEvents, tc.wantCrashType)
+				}
+			}
+			if total := totalFactors(m); total > 1 {
+				t.Errorf("double-counted: total=%d", total)
+			}
+		})
+	}
+}
+
+// TestClassifyLinuxEventLogEntry covers the Linux hardware catch-all: routine
+// kernel chatter hard-tagged Category="hardware" must not count as a fault.
+func TestClassifyLinuxEventLogEntry(t *testing.T) {
+	ts := "2026-01-15T10:00:00Z"
+
+	tests := []struct {
+		name         string
+		entry        EventLogEntry
+		wantCrashes  int
+		wantServices int
+		wantHangs    int
+		wantHardware int
+	}{
+		{
+			name:  "Routine kernel USB notice is NOT hardware",
+			entry: EventLogEntry{Timestamp: ts, Level: "warning", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "usb 1-1: USB disconnect, device number 5"},
+		},
+		{
+			name:         "Disk I/O error IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "blk_update_request: I/O error, dev sda"},
+			wantHardware: 1,
+		},
+		{
+			name:         "EDAC memory error IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "EDAC MC0: 1 CE memory read error"},
+			wantHardware: 1,
+		},
+		{
+			name:        "OOM kill IS a crash",
+			entry:       EventLogEntry{Timestamp: ts, Level: "critical", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "Out of memory: Killed process 1234"},
+			wantCrashes: 1,
+		},
+		{
+			name:         "systemd unit failure IS a service failure",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "systemd", EventID: "systemd:1", Message: "nginx.service: Failed with result 'exit-code'"},
+			wantServices: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetrics()
+			classifyLinuxEventLogEntry(m, tc.entry)
+			if len(m.CrashEvents) != tc.wantCrashes {
+				t.Errorf("crashes: got %d, want %d", len(m.CrashEvents), tc.wantCrashes)
+			}
+			if len(m.ServiceFailures) != tc.wantServices {
+				t.Errorf("services: got %d, want %d", len(m.ServiceFailures), tc.wantServices)
+			}
+			if len(m.AppHangs) != tc.wantHangs {
+				t.Errorf("hangs: got %d, want %d", len(m.AppHangs), tc.wantHangs)
+			}
+			if len(m.HardwareErrors) != tc.wantHardware {
+				t.Errorf("hardware: got %d, want %d", len(m.HardwareErrors), tc.wantHardware)
+			}
+			if total := totalFactors(m); total > 1 {
+				t.Errorf("double-counted: total=%d", total)
+			}
+		})
+	}
+}
+
+func TestCrashReportKind(t *testing.T) {
+	cases := []struct {
+		name     string
+		bugType  string
+		procName string
+		want     string
+	}{
+		// bug_type is authoritative even when the filename/procName say otherwise.
+		{"Kernel-2026-06-27.ips", "210", "Unknown", "Kernel panic"},
+		{"JetsamEvent-2026-06-27.ips", "298", "Unknown", "JetsamEvent"},
+		{"wdavdaemon-2026-06-27.ips", "309", "wdavdaemon", "Application crash"},
+		// Fallbacks when bug_type is absent (legacy reports).
+		{"panic-full-2026.ips", "", "Unknown", "Kernel panic"},
+		{"weird.ips", "", "kernel", "Kernel panic"},
+		{"JetsamEvent-legacy.ips", "", "Unknown", "JetsamEvent"},
+		{"Chrome-2026-06-27.ips", "", "Chrome", "Application crash"},
+	}
+	for _, tc := range cases {
+		if got := crashReportKind(tc.name, tc.bugType, tc.procName); got != tc.want {
+			t.Errorf("crashReportKind(%q,%q,%q) = %q, want %q", tc.name, tc.bugType, tc.procName, got, tc.want)
+		}
+	}
+}
