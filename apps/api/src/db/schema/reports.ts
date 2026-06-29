@@ -8,7 +8,8 @@ export const reportTypeEnum = pgEnum('report_type', [
   'alert_summary',
   'compliance',
   'performance',
-  'executive_summary'
+  'executive_summary',
+  'security_compliance_posture'
 ]);
 
 export const reportScheduleEnum = pgEnum('report_schedule', [
@@ -50,5 +51,6 @@ export const reportRuns = pgTable('report_runs', {
   outputUrl: text('output_url'),
   errorMessage: text('error_message'),
   rowCount: integer('row_count'),
+  result: jsonb('result'),
   createdAt: timestamp('created_at').defaultNow().notNull()
 });
