@@ -247,8 +247,38 @@ describe('org routes', () => {
   });
 
   describe('POST /orgs/partners', () => {
+    it("returns 409 when the new slug collides with an existing partner's inbound local part", async () => {
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'other-partner' }])
+          })
+        })
+      } as any);
+
+      const res = await app.request('/orgs/partners', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Partner',
+          slug: 'support'
+        })
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: 'That partner identifier is already in use' });
+      expect(db.transaction).not.toHaveBeenCalled();
+    });
+
     it('should create a partner and seed system ticket statuses', async () => {
       const partner = { id: 'partner-1', name: 'Partner' };
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
       vi.mocked(db.transaction).mockImplementation(async (fn: (tx: any) => any) => {
         const tx = {
           insert: vi.fn(() => ({
@@ -341,6 +371,26 @@ describe('org routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.name).toBe('Updated');
+    });
+
+    it("returns 409 when the updated slug collides with another partner's inbound local part", async () => {
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'other-partner' }])
+          })
+        })
+      } as any);
+
+      const res = await app.request('/orgs/partners/partner-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: 'support' })
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: 'That partner identifier is already in use' });
+      expect(db.update).not.toHaveBeenCalled();
     });
 
     // #1318: a system-scoped wholesale settings write must mirror
@@ -2299,6 +2349,117 @@ describe('org routes', () => {
       });
 
       expect(res.status).toBe(404);
+    });
+
+    describe('PATCH /partners/me — inboundLocalPart', () => {
+      function mockCurrentPartnerSelect() {
+        const currentPartner = { id: 'partner-123', name: 'Acme MSP', settings: {} };
+        vi.mocked(db.select)
+          .mockReturnValueOnce({
+            from: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([currentPartner])
+              })
+            })
+          } as any)
+          .mockReturnValue({
+            from: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                orderBy: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockResolvedValue([])
+                }),
+                limit: vi.fn().mockResolvedValue([])
+              })
+            })
+          } as any);
+        return currentPartner;
+      }
+
+      async function patchPartnerMe(body: unknown) {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        return app.request('/orgs/partners/me', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+      }
+
+      it('persists a valid inboundLocalPart', async () => {
+        const currentPartner = mockCurrentPartnerSelect();
+        let capturedUpdateData: any;
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockImplementation((data: any) => {
+            capturedUpdateData = data;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ ...currentPartner, inboundLocalPart: data.inboundLocalPart }])
+              })
+            };
+          })
+        } as any);
+
+        const res = await patchPartnerMe({ inboundLocalPart: 'support' });
+
+        expect(res.status).toBe(200);
+        expect(capturedUpdateData.inboundLocalPart).toBe('support');
+      });
+
+      it('rejects an invalid inboundLocalPart format with 422', async () => {
+        const res = await patchPartnerMe({ inboundLocalPart: 'Bad Address!' });
+
+        expect(res.status).toBe(422);
+      });
+
+      it('rejects a reserved inboundLocalPart with 422', async () => {
+        mockCurrentPartnerSelect();
+
+        const res = await patchPartnerMe({ inboundLocalPart: 'postmaster' });
+
+        expect(res.status).toBe(422);
+      });
+
+      it('rejects an inboundLocalPart collision with another partner with 409', async () => {
+        const currentPartner = { id: 'partner-123', name: 'Acme MSP', settings: {} };
+        vi.mocked(db.select)
+          .mockReturnValueOnce({
+            from: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([currentPartner])
+              })
+            })
+          } as any)
+          .mockReturnValueOnce({
+            from: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([{ id: 'other-partner' }])
+              })
+            })
+          } as any);
+
+        const res = await patchPartnerMe({ inboundLocalPart: 'taken' });
+
+        expect(res.status).toBe(409);
+      });
+
+      it('clears inboundLocalPart when null is sent', async () => {
+        const currentPartner = mockCurrentPartnerSelect();
+        let capturedUpdateData: any;
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockImplementation((data: any) => {
+            capturedUpdateData = data;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ ...currentPartner, inboundLocalPart: data.inboundLocalPart }])
+              })
+            };
+          })
+        } as any);
+
+        const res = await patchPartnerMe({ inboundLocalPart: null });
+
+        expect(res.status).toBe(200);
+        expect(capturedUpdateData.inboundLocalPart).toBeNull();
+      });
     });
 
     it('preserves existing settings keys when applying a partial update', async () => {
