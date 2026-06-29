@@ -5,6 +5,7 @@ import BillablesExportCard from './BillablesExportCard';
 import TicketStatusesTab from './TicketStatusesTab';
 import TicketPrioritiesTab from './TicketPrioritiesTab';
 import InboundEmailCard from './InboundEmailCard';
+import M365MailboxCard from './M365MailboxCard';
 import CannedResponsesCard from './CannedResponsesCard';
 import { getJwtClaims } from '../../lib/authScope';
 
@@ -54,8 +55,20 @@ function hashFor(tab: Tab): string {
  * Partner hub (which owns the top-level tab hash, e.g. `#ticketing`) we leave it
  * off so the two don't fight over `window.location.hash`.
  */
-export default function TicketingSettingsTabs({ syncHash = true }: { syncHash?: boolean }) {
-  const [activeTab, setActiveTab] = useState<Tab>('statuses');
+export default function TicketingSettingsTabs({
+  syncHash = true,
+  initialTab,
+}: {
+  syncHash?: boolean;
+  initialTab?: Tab;
+}) {
+  // `initialTab` seeds the sub-tab deterministically for the embedded (syncHash=false)
+  // case — used by the M365 consent deep-link (`?ticketMailbox=…`) so this group opens
+  // on Inbound regardless of when it mounts. The parent captures that signal once (it
+  // mounts a single time); we must NOT re-read the URL param here because the mailbox
+  // card strips it on mount, and this group can remount when the parent's loading state
+  // toggles — re-reading would lose the signal (the tab would snap back to Statuses).
+  const [activeTab, setActiveTab] = useState<Tab>(initialTab ?? 'statuses');
 
   // Render the Inbound Email tab only for partner-scoped users (matches how the
   // Sidebar gates other partner-only settings surfaces). Decoded client-side as
@@ -128,8 +141,9 @@ export default function TicketingSettingsTabs({ syncHash = true }: { syncHash?: 
       {activeTab === 'export' && <BillablesExportCard />}
 
       {activeTab === 'inbound' && canManageInbound && (
-        <div data-testid="ticketing-tab-panel-inbound">
+        <div data-testid="ticketing-tab-panel-inbound" className="space-y-6">
           <InboundEmailCard />
+          <M365MailboxCard />
         </div>
       )}
 

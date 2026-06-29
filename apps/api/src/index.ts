@@ -30,6 +30,7 @@ import { automationRoutes, automationWebhookRoutes } from './routes/automations'
 import { alertRoutes } from './routes/alerts';
 import { alertTemplateRoutes } from './routes/alertTemplates';
 import { ticketsRoutes } from './routes/tickets';
+import { mailboxRoutes } from './routes/tickets/mailboxConnect';
 import { catalogRoutes } from './routes/catalog';
 import { emailWebhookRoutes } from './routes/tickets/emailWebhook';
 import { invoiceRoutes } from './routes/invoices';
@@ -241,6 +242,7 @@ import { initializeQuoteExpiryReaper, shutdownQuoteExpiryReaper } from './jobs/q
 import { initializeTicketNotifyWorker, shutdownTicketNotifyWorker } from './jobs/ticketNotifyWorker';
 import { initializeTicketSlaWorker, shutdownTicketSlaWorker } from './jobs/ticketSlaWorker';
 import { initializeInboundEmailWorker, shutdownInboundEmailWorker } from './jobs/inboundEmailWorker';
+import { initializeTicketMailboxPollWorker } from './jobs/ticketMailboxPollWorker';
 import { initializePolicyAlertBridge } from './services/policyAlertBridge';
 import { getWebhookWorker, initializeWebhookDelivery } from './workers/webhookDelivery';
 import { decryptForColumn } from './services/secretCrypto';
@@ -763,6 +765,13 @@ api.route('/automations/webhooks', automationWebhookRoutes);
 api.route('/automations', automationRoutes);
 api.route('/alerts', alertRoutes);
 api.route('/alert-templates', alertTemplateRoutes);
+// M365 mailbox OAuth + connection routes. Mounted as its OWN top-level router
+// (NOT under ticketsRoutes) and BEFORE /tickets so its literal /tickets/mailbox/*
+// paths win over ticketsRoutes' generic /:id matchers, and — critically — so the
+// unauthenticated /tickets/mailbox/callback escapes ticketsRoutes' .use('*',
+// authMiddleware) gate (the Microsoft admin-consent redirect carries no Bearer
+// token). The callback authenticates via signed state + binding cookie instead.
+api.route('/tickets/mailbox', mailboxRoutes);
 api.route('/tickets', ticketsRoutes);
 api.route('/catalog', catalogRoutes);
 api.route('/invoices', invoiceRoutes);
@@ -1183,6 +1192,7 @@ async function initializeWorkers(): Promise<void> {
     ['ticketNotifyWorker', initializeTicketNotifyWorker],
     ['ticketSlaWorker', initializeTicketSlaWorker],
     ['inboundEmailWorker', initializeInboundEmailWorker],
+    ['ticketMailboxPollWorker', initializeTicketMailboxPollWorker],
     ['invoiceWorker', initializeInvoiceWorkers],
     ['contractWorker', initializeContractWorkers],
   ];
