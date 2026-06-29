@@ -35,6 +35,7 @@ export function sellerLines(a: SellerSnapshot['address'] | null | undefined): st
 // (packages/shared/src/types/billing-enums.ts). Imported for the Record maps
 // below and re-exported so existing './invoiceTypes' consumers are unaffected.
 import type { InvoiceStatus, PaymentMethod, InvoiceLineSourceType } from '@breeze/shared';
+import { computeQuoteProfit, type QuoteProfit } from '@breeze/shared';
 export type { InvoiceStatus, PaymentMethod, InvoiceLineSourceType };
 
 export interface InvoiceSummary {
@@ -207,6 +208,47 @@ export function lineTaxAmount(
   const cents = Math.round(Number(lineTotal) * 100);
   if (!Number.isFinite(rate) || rate <= 0 || !Number.isFinite(cents)) return null;
   return Math.round(cents * rate) / 100;
+}
+
+/**
+ * Internal profit summary for an invoice, computed with the same shared cents
+ * math (`computeQuoteProfit`) the quote editor/detail rails use — so the invoice
+ * margin is rounded and labelled identically to a quote's, with no second,
+ * drifting implementation. (It does NOT assert numeric equality with any
+ * originating quote: invoices are edited independently after issue and need not
+ * originate from a quote at all.)
+ *
+ * Bundles are the subtlety. A bundle persists as a parent rollup line whose
+ * `costBasis` is the FULL bundle cost (`Σ component.costBasis × component.qty`,
+ * see `computeBundleEconomicsFrom`) plus child component lines that each carry
+ * their OWN `costBasis` and may be `customerVisible`. Folding over every line
+ * would count a visible component's cost twice (parent rollup + child). So we
+ * fold over TOP-LEVEL lines only (`parentLineId === null`): the parent represents
+ * each bundle exactly once, and every manual/catalog line is already top-level.
+ * Children are excluded by parentage, not visibility — a *visible* component must
+ * still not be double-counted.
+ *
+ * Each top-level line maps straight through (raw `quantity`/`unitPrice`/
+ * `costBasis`, same as the quote mapping) so the shared cents math does a single
+ * round and a null `costBasis` is counted in `linesMissingCost` (driving the
+ * "estimate incomplete" warning) rather than silently booked as $0. Invoices are
+ * one-time → `recurrence: 'one_time'`, so the monthly/annual nets stay 0 and
+ * `MarginPanel` self-hides those rows. Billed-only (`customerVisible`) and
+ * tax-excluded — the same contract as quotes.
+ */
+export function computeInvoiceProfit(lines: InvoiceLine[]): QuoteProfit {
+  return computeQuoteProfit(
+    lines
+      .filter((l) => l.parentLineId === null)
+      .map((l) => ({
+        quantity: l.quantity,
+        unitPrice: l.unitPrice,
+        unitCost: l.costBasis,
+        taxable: l.taxable,
+        customerVisible: l.customerVisible,
+        recurrence: 'one_time' as const,
+      })),
+  );
 }
 
 /** Render an ISO date (YYYY-MM-DD or timestamp) as a short locale date, '—' if absent. */

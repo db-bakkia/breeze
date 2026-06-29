@@ -60,14 +60,66 @@ describe('InvoiceDetail', () => {
     render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
     await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
 
-    // Customer view: hidden bundle child not rendered, no cost column.
+    // Customer view: hidden bundle child not rendered, no per-line cost/margin
+    // columns. (Scoped to the table headers — the internal margin summary panel
+    // carries its own "Cost" label and is always visible to readers.)
     expect(screen.queryByTestId('invoice-detail-line-l2')).not.toBeInTheDocument();
-    expect(screen.queryByText('Cost')).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Cost' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Margin' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId('invoice-accounting-toggle'));
     expect(screen.getByTestId('invoice-detail-line-l2')).toBeInTheDocument();
-    expect(screen.getByText('Cost')).toBeInTheDocument();
-    expect(screen.getByText('Margin')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Cost' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Margin' })).toBeInTheDocument();
+  });
+
+  it('renders the internal margin summary (billed-only, one-time, excludes tax)', async () => {
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+
+    // l1 is the only top-level line: revenue 120 − cost (80×1) = 40. l2 is a bundle
+    // child (parentLineId 'l1'), so it's excluded from the summary regardless of
+    // visibility — its cost is already rolled into the parent.
+    expect(screen.getByTestId('invoice-margin-cost')).toHaveTextContent('$80.00');
+    expect(screen.getByTestId('invoice-margin-net-onetime')).toHaveTextContent('$40.00');
+    // Invoices are one-time → the recurring profit rows never appear.
+    expect(screen.queryByTestId('invoice-margin-net-monthly')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-margin-net-annual')).not.toBeInTheDocument();
+    // Every counted line has a cost → no "estimate incomplete" warning.
+    expect(screen.queryByTestId('invoice-margin-missing-cost')).not.toBeInTheDocument();
+  });
+
+  it('counts a bundle once — a VISIBLE component is not double-counted', async () => {
+    // A bundle persists as a parent rollup line whose costBasis is the full bundle
+    // cost (Σ component costs) PLUS child component lines that each carry their own
+    // costBasis. Here the parent (p1) rolls up cost 80 / revenue 120, and a VISIBLE
+    // component child (c1) carries its own cost 10. Summing every line would give
+    // cost 90 / net 30; folding over top-level lines only gives the correct
+    // cost 80 / net 40 — the parent already includes the component's cost.
+    const bundle: InvoiceDetailData = {
+      ...issued,
+      lines: [
+        { ...lines[0], id: 'p1', parentLineId: null, costBasis: '80.00', revenueAllocation: '120.00', customerVisible: true, quantity: '1.00', unitPrice: '120.00', lineTotal: '120.00' },
+        { ...lines[1], id: 'c1', parentLineId: 'p1', costBasis: '10.00', revenueAllocation: '40.00', customerVisible: true, quantity: '1.00', unitPrice: '0.00', lineTotal: '0.00' },
+      ],
+    };
+    render(<InvoiceDetail detail={bundle} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-margin-cost')).toHaveTextContent('$80.00');
+    expect(screen.getByTestId('invoice-margin-net-onetime')).toHaveTextContent('$40.00');
+    expect(screen.queryByTestId('invoice-margin-missing-cost')).not.toBeInTheDocument();
+  });
+
+  it('warns in the margin summary when a billed line has no cost', async () => {
+    const noCost: InvoiceDetailData = {
+      ...issued,
+      lines: [{ ...lines[0], costBasis: null }],
+    };
+    render(<InvoiceDetail detail={noCost} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-margin-missing-cost')).toHaveTextContent('1 line missing a cost');
+    // The line is excluded from the net, so profit reads as $0.00 (not negative).
+    expect(screen.getByTestId('invoice-margin-net-onetime')).toHaveTextContent('$0.00');
   });
 
   it('records a payment via the form', async () => {
@@ -100,6 +152,21 @@ describe('InvoiceDetail', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
     const postCall = fetchMock.mock.calls.find((c) => String(c[0]).endsWith('/payments') && (c[1] as RequestInit)?.method === 'POST');
     expect(JSON.parse((postCall![1] as RequestInit).body as string)).toMatchObject({ amount: 50, method: 'check' });
+  });
+
+  it('blocks payment recording on a draft and explains why', async () => {
+    const draft: InvoiceDetailData = {
+      ...issued,
+      invoice: { ...issued.invoice, status: 'draft', invoiceNumber: null },
+    };
+    render(<InvoiceDetail detail={draft} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    // The payment form / pay-link must not be offered before an invoice is issued.
+    expect(screen.queryByTestId('invoice-payment-form')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-submit')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-pay-link')).not.toBeInTheDocument();
+    // Instead the operator is told what unlocks it.
+    expect(screen.getByTestId('invoice-payments-draft-hint')).toHaveTextContent('Issue this invoice to record payments.');
   });
 
   it('shows the void action for an issued invoice and opens the dialog', async () => {

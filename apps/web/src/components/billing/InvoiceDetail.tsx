@@ -21,7 +21,9 @@ import {
   lineBlurb,
   pctFromFraction,
   sellerLines,
+  computeInvoiceProfit,
 } from './invoiceTypes';
+import { MarginPanel } from './billingUi';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -84,6 +86,14 @@ export default function InvoiceDetail({ detail, onChanged }: Props) {
     [accountingView, lines],
   );
 
+  // Cost/margin is an internal read affordance, visible to anyone who can read
+  // the invoice (the same read-level gate the quote rails use for `quotes:read`;
+  // cost is a read affordance, not a write one). Independent of the per-line
+  // Accounting view toggle below, which defaults off. Uses the shared cents math
+  // so the figure is rounded + labelled identically to a quote's.
+  const canSeeMargin = can('invoices', 'read');
+  const profit = useMemo(() => computeInvoiceProfit(lines), [lines]);
+
   const lineMargin = (l: InvoiceLine): string => {
     if (l.costBasis == null) return '—';
     const revenue = Number(l.revenueAllocation ?? l.lineTotal);
@@ -95,7 +105,11 @@ export default function InvoiceDetail({ detail, onChanged }: Props) {
   // header Tax row), otherwise it'd be a column of dashes.
   const showTax = Number(invoice.taxTotal) > 0;
 
-  const canRecordPayment = invoice.status !== 'void' && invoice.status !== 'paid' && Number(invoice.balance) > 0;
+  // Payments only attach to a live invoice: a draft has no number and isn't owed
+  // yet, so taking money against it would book a payment to an invoice that was
+  // never issued. Gate on a non-draft, unpaid, still-owing status.
+  const canRecordPayment =
+    invoice.status !== 'draft' && invoice.status !== 'void' && invoice.status !== 'paid' && Number(invoice.balance) > 0;
   const canVoid = invoice.status !== 'void' && invoice.status !== 'draft';
 
   const downloadPdf = useCallback(async () => {
@@ -329,6 +343,10 @@ export default function InvoiceDetail({ detail, onChanged }: Props) {
                 {formatMoney(invoice.balance, currency)}
               </span>
             </div>
+            {/* Internal margin summary — profitability stays visible after the
+                invoice is issued and the Editor tab disappears (same reason
+                QuoteDetail renders it). Never reaches the customer document. */}
+            {canSeeMargin && <MarginPanel profit={profit} currency={currency} idPrefix="invoice" />}
           </div>
 
           {/* Seller From block */}
@@ -439,6 +457,12 @@ export default function InvoiceDetail({ detail, onChanged }: Props) {
               </ul>
             )}
 
+            {invoice.status === 'draft' && (
+              <p className="mt-3 text-xs text-muted-foreground" data-testid="invoice-payments-draft-hint">
+                Issue this invoice to record payments.
+              </p>
+            )}
+
             {canRecordPayment && stripeConnected && can('invoices', 'send') && (
               <button
                 type="button" onClick={() => void sendPayLink()} disabled={busy}
@@ -527,7 +551,7 @@ export default function InvoiceDetail({ detail, onChanged }: Props) {
         isLoading={busy}
         variant="warning"
         title="Record payment"
-        message={`Record a ${formatMoney(Number(payAmount), currency)} payment (${PAYMENT_METHOD_LABELS[payMethod]}) dated ${payDate}?`}
+        message={`Record a ${formatMoney(Number(payAmount), currency)} payment (${PAYMENT_METHOD_LABELS[payMethod]}) dated ${formatDate(payDate)}?`}
         confirmLabel="Record payment"
         confirmTestId="invoice-payment-confirm"
       />
@@ -545,10 +569,10 @@ export default function InvoiceDetail({ detail, onChanged }: Props) {
       />
 
       {/* Void dialog */}
-      <Dialog open={voidOpen} onClose={() => setVoidOpen(false)} title="Void invoice" maxWidth="md" className="p-6">
+      <Dialog open={voidOpen} onClose={() => setVoidOpen(false)} title="Void invoice" labelledBy="invoice-void-title" maxWidth="md" className="p-6">
         <div className="space-y-4" data-testid="invoice-void-dialog">
           <div>
-            <h2 className="text-lg font-semibold">Void invoice</h2>
+            <h2 id="invoice-void-title" className="text-lg font-semibold">Void invoice</h2>
             <p className="mt-1 text-sm text-muted-foreground">
               Voiding releases billed work so it can be re-invoiced. This cannot be undone.
             </p>
