@@ -336,8 +336,20 @@ const bulkDismissSchema = z.object({
 const updateAssetSchema = z.object({
   label: z.string().max(255).optional(),
   notes: z.string().nullish(),
-  tags: z.string().array().optional()
-});
+  tags: z.string().array().optional(),
+  // NOTE: keep this list literal — do NOT derive it from `discoveredAssetTypeEnum.enumValues`.
+  // Several sibling tests fully mock '../db/schema' (vi.mock without importOriginal), so a
+  // runtime reference to the enum here makes this module throw at import in those suites
+  // (green locally, red in the full CI run — see #1424 / partner_multi_org_orgid.test.ts).
+  assetType: z.enum([
+    'workstation', 'server', 'printer', 'router', 'switch', 'firewall',
+    'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown'
+  ]).optional(),
+  resetTypeToAuto: z.boolean().optional()
+}).refine(
+  (v) => !(v.assetType !== undefined && v.resetTypeToAuto === true),
+  { message: 'assetType and resetTypeToAuto are mutually exclusive' }
+);
 
 // --- Routes ---
 
@@ -953,6 +965,9 @@ discoveryRoutes.get(
           responseTimeMs: a.responseTimeMs,
           linkedDeviceId: a.linkedDeviceId,
           linkedDeviceName: row.linkedDeviceDisplayName ?? row.linkedDeviceHostname ?? null,
+          linkSource: a.linkSource,
+          typeSource: a.typeSource,
+          detectedAssetType: a.detectedAssetType,
           snmpMonitoringEnabled: Boolean(row.snmpMonitoringEnabled),
           networkMonitoringEnabled: Boolean(row.networkMonitoringEnabled),
           monitoringEnabled: Boolean(row.snmpMonitoringEnabled) || Boolean(row.networkMonitoringEnabled),
@@ -1052,6 +1067,9 @@ discoveryRoutes.get(
         responseTimeMs: a.responseTimeMs,
         linkedDeviceId: a.linkedDeviceId,
         linkedDeviceName: row.linkedDeviceDisplayName ?? row.linkedDeviceHostname ?? null,
+        linkSource: a.linkSource,
+        typeSource: a.typeSource,
+        detectedAssetType: a.detectedAssetType,
         snmpMonitoringEnabled: Boolean(row.snmpMonitoringEnabled),
         networkMonitoringEnabled: Boolean(row.networkMonitoringEnabled),
         monitoringEnabled: Boolean(row.snmpMonitoringEnabled) || Boolean(row.networkMonitoringEnabled),
@@ -1155,6 +1173,20 @@ discoveryRoutes.patch(
     if (updates.label !== undefined) setValues.label = updates.label;
     if (updates.notes !== undefined) setValues.notes = updates.notes;
     if (updates.tags !== undefined) setValues.tags = updates.tags;
+    if (updates.assetType !== undefined) {
+      setValues.assetType = updates.assetType;
+      setValues.typeSource = 'manual';
+    }
+    if (updates.resetTypeToAuto) {
+      // Restore the scan's last classification; fall back to current type if
+      // the asset was never auto-classified (detectedAssetType still null).
+      setValues.assetType = sql`coalesce(${discoveredAssets.detectedAssetType}, ${discoveredAssets.assetType})`;
+      setValues.typeSource = 'auto';
+    }
+
+    if (Object.keys(setValues).length === 1) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
 
     const [updated] = await db.update(discoveredAssets)
       .set(setValues)
@@ -1239,6 +1271,7 @@ discoveryRoutes.post(
       .set({
         approvalStatus: 'approved',
         linkedDeviceId: body.deviceId,
+        linkSource: 'manual',
         updatedAt: new Date()
       })
       .where(eq(discoveredAssets.id, assetId))
@@ -1257,6 +1290,77 @@ discoveryRoutes.post(
       resourceId: updated.id,
       resourceName: updated.hostname ?? updated.ipAddress ?? undefined,
       details: { linkedDeviceId: body.deviceId }
+    });
+
+    return c.json(updated);
+  }
+);
+
+discoveryRoutes.delete(
+  '/assets/:id/link',
+  requireScope('organization', 'partner', 'system'),
+  requireDiscoveryWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const assetId = c.req.param('id')!;
+    const orgResult = await resolveOrgIdForAsset(auth, assetId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+
+    const conditions: SQL[] = [eq(discoveredAssets.id, assetId)];
+    if (orgResult.orgId) conditions.push(eq(discoveredAssets.orgId, orgResult.orgId));
+
+    const [existing] = await db.select({
+      id: discoveredAssets.id,
+      orgId: discoveredAssets.orgId,
+      siteId: discoveredAssets.siteId,
+      hostname: discoveredAssets.hostname,
+      ipAddress: discoveredAssets.ipAddress,
+      linkedDeviceId: discoveredAssets.linkedDeviceId,
+      linkSource: discoveredAssets.linkSource
+    }).from(discoveredAssets)
+      .where(and(...conditions)).limit(1);
+    if (!existing) return c.json({ error: 'Asset not found' }, 404);
+
+    // Site-scope is an app-layer-only authz axis; RLS does not defend it.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && typeof existing.siteId === 'string' && !canAccessSite(perms, existing.siteId)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    // Already unlinked: idempotent no-op.
+    if (!existing.linkedDeviceId) {
+      return c.json(existing);
+    }
+
+    // Only manually-created links may be removed here.
+    if (existing.linkSource !== 'manual') {
+      return c.json({ error: 'Only manually linked assets can be unlinked' }, 403);
+    }
+
+    const previousDeviceId = existing.linkedDeviceId;
+    // Scope the write to the same conditions as the read (id + org) so read- and
+    // write-scope match. A 0-row result here means the row vanished or was
+    // re-scoped between the select and update — treat it as not-found and
+    // audit nothing, rather than recording a misleading "unlink" success.
+    const [updated] = await db.update(discoveredAssets)
+      .set({
+        linkedDeviceId: null,
+        linkSource: null,
+        updatedAt: new Date()
+      })
+      .where(and(...conditions))
+      .returning();
+
+    if (!updated) return c.json({ error: 'Asset not found' }, 404);
+
+    writeRouteAudit(c, {
+      orgId: updated.orgId,
+      action: 'discovery.asset.unlink',
+      resourceType: 'discovered_asset',
+      resourceId: updated.id,
+      resourceName: updated.hostname ?? updated.ipAddress ?? undefined,
+      details: { previousLinkedDeviceId: previousDeviceId }
     });
 
     return c.json(updated);

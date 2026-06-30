@@ -42,3 +42,32 @@ describe('DiscoveredAssetList transforms — snmpData seam (#1731)', () => {
     expect(detail.snmpData).toEqual({});
   });
 });
+
+it('mapAsset carries typeSource and detectedType through', () => {
+  const mapped = mapAsset({
+    id: 'a1', assetType: 'router', typeSource: 'manual', detectedAssetType: 'workstation'
+  } as any);
+  expect(mapped.typeSource).toBe('manual');
+  expect(mapped.detectedType).toBe('workstation');
+});
+
+it('mapAsset defaults typeSource to auto and detectedType to null when absent', () => {
+  const mapped = mapAsset({ id: 'a2', assetType: 'server' } as any);
+  expect(mapped.typeSource).toBe('auto');
+  expect(mapped.detectedType).toBe(null);
+});
+
+it('mapAsset falls back to unknown for an unrecognized detectedAssetType', () => {
+  const mapped = mapAsset({ id: 'a3', assetType: 'server', detectedAssetType: 'martian-device' } as any);
+  expect(mapped.detectedType).toBe('unknown');
+});
+
+it('mapAsset defends an invalid typeSource string to auto', () => {
+  const mapped = mapAsset({ id: 'a4', assetType: 'server', typeSource: 'garbage' } as any);
+  expect(mapped.typeSource).toBe('auto');
+});
+
+it('mapAsset preserves a manual typeSource', () => {
+  const mapped = mapAsset({ id: 'a5', assetType: 'server', typeSource: 'manual' } as any);
+  expect(mapped.typeSource).toBe('manual');
+});

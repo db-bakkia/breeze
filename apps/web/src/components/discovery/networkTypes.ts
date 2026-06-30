@@ -52,6 +52,19 @@ export type DeviceOption = {
   label: string;
 };
 
+export type DiscoveredAssetLinkSource = 'manual' | 'auto';
+export type DiscoveredAssetTypeSource = 'manual' | 'auto';
+
+// A discovered asset can only be unlinked when it was linked manually. Auto
+// (MAC/IP-matched) and unknown (NULL, pre-dates link_source) links are not
+// unlinkable — the discovery worker would just recreate an auto link. The
+// server enforces this authoritatively; the UI uses this to gate the button.
+export function isManualLink(
+  source: DiscoveredAssetLinkSource | null | undefined
+): boolean {
+  return source === 'manual';
+}
+
 export const eventTypeConfig: Record<NetworkEventType, { label: string; color: string }> = {
   new_device: { label: 'New Device', color: 'bg-success/15 text-success border-success/30' },
   device_disappeared: { label: 'Disappeared', color: 'bg-warning/15 text-warning border-warning/30' },
@@ -69,6 +82,17 @@ function asString(value: unknown): string | null {
 
 function asBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
+}
+
+export function parseDiscoveredAssetLinkSource(value: unknown): DiscoveredAssetLinkSource | null {
+  return value === 'manual' || value === 'auto' ? value : null;
+}
+
+// Unlike linkSource (nullable), typeSource always resolves to a concrete value:
+// legacy/unrecognized payloads default to 'auto' (which hides the
+// "Reset to auto-detected" control).
+export function parseDiscoveredAssetTypeSource(value: unknown): DiscoveredAssetTypeSource {
+  return value === 'manual' ? 'manual' : 'auto';
 }
 
 function asInteger(value: unknown): number | null {

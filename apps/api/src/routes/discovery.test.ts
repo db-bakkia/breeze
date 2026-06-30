@@ -5,6 +5,7 @@ import { db } from '../db';
 import { authMiddleware } from '../middleware/auth';
 import { isRedisAvailable } from '../services/redis';
 import { decryptSecret, isEncryptedSecret } from '../services/secretCrypto';
+import { writeRouteAudit } from '../services/auditEvents';
 import { networkTopology, topologyLayout, discoveredAssets, sites } from '../db/schema';
 
 vi.mock('../services', () => ({}));
@@ -579,6 +580,72 @@ describe('discovery routes', () => {
       expect(body.data[0].snmpData).toEqual(snmp);
       expect(body.data[0].discoveryMethods).toEqual(['ping', 'snmp']);
     });
+
+    // Regression guard: the list serializer must forward typeSource and
+    // detectedAssetType so the frontend can show the override badge without
+    // fetching individual asset detail pages.
+    it('projects typeSource and detectedAssetType in the asset list response', async () => {
+      const now = new Date();
+      const row = {
+        asset: {
+          id: 'asset-002',
+          orgId: '00000000-0000-0000-0000-000000000000',
+          assetType: 'router',
+          approvalStatus: 'approved',
+          isOnline: true,
+          hostname: 'router-01',
+          label: null,
+          ipAddress: '10.0.2.1',
+          macAddress: null,
+          manufacturer: null,
+          model: null,
+          openPorts: [],
+          snmpData: null,
+          responseTimeMs: null,
+          linkedDeviceId: null,
+          discoveryMethods: [],
+          notes: null,
+          tags: [],
+          typeSource: 'manual',
+          detectedAssetType: 'switch',
+          firstSeenAt: now,
+          lastSeenAt: now,
+          createdAt: now,
+          updatedAt: now,
+        },
+        snmpMonitoringEnabled: false,
+        networkMonitoringEnabled: false,
+        linkedDeviceHostname: null,
+        linkedDeviceDisplayName: null,
+        profileId: null,
+        profileName: null,
+        profileSubnets: null,
+      };
+
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({
+          leftJoin: () => ({
+            leftJoin: () => ({
+              leftJoin: () => ({
+                where: () => ({
+                  orderBy: () => Promise.resolve([row]),
+                }),
+              }),
+            }),
+          }),
+        }),
+      });
+
+      const res = await app.request('/discovery/assets', {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].typeSource).toBe('manual');
+      expect(body.data[0].detectedAssetType).toBe('switch');
+    });
   });
 
   describe('GET /discovery/assets/:id', () => {
@@ -603,7 +670,8 @@ describe('discovery routes', () => {
           osFingerprint: null,
           snmpData: { sysName: 'srv-files' },
           responseTimeMs: 1,
-          linkedDeviceId: null,
+          linkedDeviceId: null as string | null,
+          linkSource: null as string | null,
           discoveryMethods: ['ping'],
           notes: null,
           tags: [],
@@ -647,6 +715,21 @@ describe('discovery routes', () => {
       expect(body.data.id).toBe(ASSET_ID);
       expect(body.data.ipAddress).toBe('10.0.20.10');
       expect(body.data.snmpData).toEqual({ sysName: 'srv-files' });
+    });
+
+    it('GET /assets/:id includes linkSource', async () => {
+      const row = buildRow();
+      row.asset.linkedDeviceId = '00000000-0000-0000-0000-000000000021';
+      row.asset.linkSource = 'manual';
+      mockSingleAsset([row]);
+
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.linkSource).toBe('manual');
     });
 
     it('returns 404 when the asset does not exist in the caller org', async () => {
@@ -1237,6 +1320,38 @@ describe('discovery routes', () => {
         expect(res.status).toBe(200);
       });
 
+      it('manual link sets linkSource to manual', async () => {
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetThenDevice(
+          { id: ASSET_IN, orgId: ORG, siteId: SITE_IN },
+          { id: DEVICE_ID, orgId: ORG, siteId: SITE_IN }
+        );
+        let capturedSetPayload: any;
+        vi.mocked(db.update).mockReturnValueOnce({
+          set: vi.fn((payload) => {
+            capturedSetPayload = payload;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ id: ASSET_IN, orgId: ORG, linkedDeviceId: DEVICE_ID }])
+              })
+            };
+          })
+        } as any);
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({ deviceId: DEVICE_ID })
+        });
+
+        expect(res.status).toBe(200);
+        expect(capturedSetPayload).toMatchObject({
+          linkedDeviceId: expect.any(String),
+          approvalStatus: 'approved',
+          linkSource: 'manual'
+        });
+      });
+
       it('does not gate when the caller is unrestricted (no allowedSiteIds)', async () => {
         setSiteRestrictedAuth(undefined);
         mockAssetThenDevice(
@@ -1258,6 +1373,158 @@ describe('discovery routes', () => {
         });
 
         expect(res.status).toBe(200);
+      });
+    });
+
+    describe('DELETE /assets/:id/link (unlink)', () => {
+      function mockAssetOnly(asset: any) {
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(asset ? [asset] : []),
+            }),
+          }),
+        } as any);
+      }
+
+      it('clears a manual link, keeps approval_status approved, writes audit', async () => {
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly({
+          id: ASSET_IN,
+          orgId: ORG,
+          siteId: SITE_IN,
+          hostname: 'printer-1',
+          ipAddress: '10.0.0.50',
+          linkedDeviceId: DEVICE_ID,
+          linkSource: 'manual'
+        });
+        let capturedSetPayload: any;
+        vi.mocked(db.update).mockReturnValueOnce({
+          set: vi.fn((payload) => {
+            capturedSetPayload = payload;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{
+                  id: ASSET_IN,
+                  orgId: ORG,
+                  hostname: 'printer-1',
+                  ipAddress: '10.0.0.50',
+                  linkedDeviceId: null,
+                  linkSource: null
+                }])
+              })
+            };
+          })
+        } as any);
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        expect(capturedSetPayload).toMatchObject({
+          linkedDeviceId: null,
+          linkSource: null
+        });
+        expect(capturedSetPayload).not.toHaveProperty('approvalStatus');
+        expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+          action: 'discovery.asset.unlink'
+        }));
+      });
+
+      it('rejects when the asset is in a site outside the caller allowlist', async () => {
+        // Site-scope is app-layer-only (RLS does not defend it), so this guard is
+        // the sole backstop — mirror the POST link route's site-denial coverage.
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly({
+          id: ASSET_IN,
+          orgId: ORG,
+          siteId: SITE_OUT,
+          linkedDeviceId: DEVICE_ID,
+          linkSource: 'manual'
+        });
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.error).toBe('Access to this site denied');
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 for an auto-linked asset', async () => {
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly({
+          id: ASSET_IN,
+          orgId: ORG,
+          siteId: SITE_IN,
+          linkedDeviceId: DEVICE_ID,
+          linkSource: 'auto'
+        });
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(403);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 for a NULL-source linked asset', async () => {
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly({
+          id: ASSET_IN,
+          orgId: ORG,
+          siteId: SITE_IN,
+          linkedDeviceId: DEVICE_ID,
+          linkSource: null
+        });
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(403);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('is a no-op for an already-unlinked asset', async () => {
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly({
+          id: ASSET_IN,
+          orgId: ORG,
+          siteId: SITE_IN,
+          linkedDeviceId: null,
+          linkSource: null
+        });
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        expect(db.update).not.toHaveBeenCalled();
+        const body = await res.json();
+        expect(body.id).toBe(ASSET_IN);
+      });
+
+      it('returns 404 when the asset is not found', async () => {
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly(null);
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(404);
       });
     });
 
@@ -1337,6 +1604,178 @@ describe('discovery routes', () => {
 
         expect(res.status).toBe(200);
       });
+    });
+  });
+
+  describe('PATCH /assets/:id type override', () => {
+    const ASSET_ID = '00000000-0000-0000-0000-000000000010';
+    const ORG = '00000000-0000-0000-0000-000000000000';
+
+    it('sets assetType and marks typeSource=manual', async () => {
+      let capturedSetPayload: any;
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn((payload) => {
+          capturedSetPayload = payload;
+          return {
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{
+                id: ASSET_ID,
+                orgId: ORG,
+                assetType: 'router',
+                typeSource: 'manual',
+                detectedAssetType: null,
+                hostname: null,
+                label: null,
+                ipAddress: '10.0.0.1',
+              }])
+            })
+          };
+        })
+      } as any);
+
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ assetType: 'router' })
+      });
+
+      expect(res.status).toBe(200);
+      expect(capturedSetPayload).toMatchObject({ assetType: 'router', typeSource: 'manual' });
+      const body = await res.json();
+      expect(body.assetType).toBe('router');
+      expect(body.typeSource).toBe('manual');
+    });
+
+    it('rejects an invalid assetType value', async () => {
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ assetType: 'gateway' })
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects assetType and resetTypeToAuto together', async () => {
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ assetType: 'router', resetTypeToAuto: true })
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects a PATCH whose only field is a falsy no-op (resetTypeToAuto:false)', async () => {
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ resetTypeToAuto: false })
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('resetTypeToAuto restores detectedAssetType and sets typeSource=auto', async () => {
+      // DB resolves coalesce(detected_asset_type, asset_type) to 'workstation'
+      let capturedSetPayload: any;
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn((payload) => {
+          capturedSetPayload = payload;
+          return {
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{
+                id: ASSET_ID,
+                orgId: ORG,
+                assetType: 'workstation',
+                typeSource: 'auto',
+                detectedAssetType: 'workstation',
+                hostname: null,
+                label: null,
+                ipAddress: '10.0.0.1',
+              }])
+            })
+          };
+        })
+      } as any);
+
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ resetTypeToAuto: true })
+      });
+
+      expect(res.status).toBe(200);
+      expect(capturedSetPayload).toMatchObject({ typeSource: 'auto' });
+      // assetType must be a Drizzle sql`coalesce(...)` expression, not a plain
+      // string — a plain 'workstation' would pass `.toBeDefined()` while masking
+      // a regression where the coalesce was dropped.
+      expect(typeof capturedSetPayload.assetType).toBe('object');
+      expect(Array.isArray((capturedSetPayload.assetType as any).queryChunks)).toBe(true);
+      const body = await res.json();
+      expect(body.assetType).toBe('workstation');
+      expect(body.typeSource).toBe('auto');
+    });
+
+    it('GET /assets/:id returns typeSource and detectedAssetType', async () => {
+      const now = new Date();
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({
+          leftJoin: () => ({
+            leftJoin: () => ({
+              leftJoin: () => ({
+                where: () => ({ limit: () => Promise.resolve([{
+                  asset: {
+                    id: ASSET_ID,
+                    orgId: ORG,
+                    siteId: '00000000-0000-0000-0000-000000000001',
+                    assetType: 'router',
+                    approvalStatus: 'approved',
+                    isOnline: true,
+                    hostname: null,
+                    label: null,
+                    ipAddress: '10.0.0.1',
+                    macAddress: null,
+                    manufacturer: null,
+                    model: null,
+                    openPorts: [],
+                    osFingerprint: null,
+                    snmpData: null,
+                    responseTimeMs: null,
+                    linkedDeviceId: null,
+                    linkSource: null,
+                    typeSource: 'manual',
+                    detectedAssetType: 'workstation',
+                    discoveryMethods: [],
+                    notes: null,
+                    tags: [],
+                    firstSeenAt: now,
+                    lastSeenAt: now,
+                    createdAt: now,
+                    updatedAt: now,
+                  },
+                  snmpMonitoringEnabled: false,
+                  networkMonitoringEnabled: false,
+                  linkedDeviceHostname: null,
+                  linkedDeviceDisplayName: null,
+                  profileId: null,
+                  profileName: null,
+                  profileSubnets: null,
+                }]) }),
+              }),
+            }),
+          }),
+        }),
+      });
+
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.typeSource).toBe('manual');
+      expect(body.data.detectedAssetType).toBe('workstation');
     });
   });
 });

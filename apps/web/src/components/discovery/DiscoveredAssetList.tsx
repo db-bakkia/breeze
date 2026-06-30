@@ -4,6 +4,16 @@ import AssetDetailModal, { type AssetDetail } from './AssetDetailModal';
 import { fetchWithAuth } from '../../stores/auth';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { ResponsiveTable, DataCard, CardField, CardActions } from '../shared/ResponsiveTable';
+import {
+  parseDiscoveredAssetLinkSource,
+  parseDiscoveredAssetTypeSource,
+  type DiscoveredAssetLinkSource,
+  type DiscoveredAssetTypeSource,
+} from './networkTypes';
+
+// Re-exported so existing consumers importing it from './DiscoveredAssetList'
+// keep working; the canonical declaration now lives in ./networkTypes.
+export type { DiscoveredAssetTypeSource };
 
 export type DiscoveredAssetApprovalStatus = 'pending' | 'approved' | 'dismissed';
 export type DiscoveredAssetType =
@@ -38,6 +48,9 @@ export type DiscoveredAsset = {
   snmpData?: Record<string, string>;
   responseTimeMs?: number | null;
   linkedDeviceId?: string | null;
+  linkSource?: DiscoveredAssetLinkSource | null;
+  typeSource?: DiscoveredAssetTypeSource | null;
+  detectedType?: DiscoveredAssetType | null;
   linkedDeviceName?: string;
   monitoringEnabled?: boolean;
   discoveryMethods?: string[];
@@ -63,6 +76,9 @@ export type ApiDiscoveryAsset = {
   snmpData?: Record<string, string> | null;
   responseTimeMs?: number | null;
   linkedDeviceId?: string | null;
+  linkSource?: DiscoveredAssetLinkSource | null;
+  typeSource?: DiscoveredAssetTypeSource | null;
+  detectedAssetType?: string | null;
   linkedDeviceName?: string | null;
   monitoringEnabled?: boolean;
   discoveryMethods?: string[] | null;
@@ -159,6 +175,13 @@ export function mapAsset(asset: ApiDiscoveryAsset): DiscoveredAsset {
     snmpData: asset.snmpData ?? undefined,
     responseTimeMs: asset.responseTimeMs ?? null,
     linkedDeviceId: asset.linkedDeviceId,
+    linkSource: parseDiscoveredAssetLinkSource(asset.linkSource),
+    // Legacy assets without provenance (or an invalid value) read as 'auto',
+    // which hides the "Reset to auto-detected" control.
+    typeSource: parseDiscoveredAssetTypeSource(asset.typeSource),
+    detectedType: asset.detectedAssetType
+      ? (assetTypeMap[asset.detectedAssetType.toLowerCase()] ?? 'unknown')
+      : null,
     linkedDeviceName: asset.linkedDeviceName ?? undefined,
     monitoringEnabled: asset.monitoringEnabled ?? false,
     discoveryMethods: asset.discoveryMethods ?? undefined,
@@ -783,6 +806,14 @@ export default function DiscoveredAssetList({ timezone }: DiscoveredAssetListPro
           // next action in this same modal (e.g. Proxy Access). Reflect the new
           // link in place so the Proxy section unlocks without a reopen.
           setSelectedAsset(prev => (prev ? { ...prev, linkedDeviceId: deviceId } : prev));
+          await fetchAssets();
+        }}
+        onUnlinked={async (assetId) => {
+          // Reflect the cleared link in place (keep the modal open, mirroring
+          // onLinked) so the panel updates without a reopen, then refresh.
+          setSelectedAsset(prev =>
+            prev && prev.id === assetId ? { ...prev, linkedDeviceId: null, linkSource: null } : prev
+          );
           await fetchAssets();
         }}
         onDeleted={async () => {

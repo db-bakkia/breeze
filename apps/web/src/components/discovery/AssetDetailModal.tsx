@@ -1,18 +1,21 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Globe, ExternalLink } from 'lucide-react';
-import type { DiscoveredAsset, OpenPortEntry } from './DiscoveredAssetList';
+import type { DiscoveredAsset, OpenPortEntry, DiscoveredAssetType } from './DiscoveredAssetList';
 import { typeConfig, approvalStatusConfig } from './DiscoveredAssetList';
 import AssetMonitoringSection from './AssetMonitoringSection';
 import { Dialog } from '../shared/Dialog';
 import { fetchWithAuth } from '../../stores/auth';
+import { extractApiError } from '../../lib/apiError';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { buildRemoteProxyPageUrl } from '@/lib/remoteTunnelUrls';
+import { isManualLink, type DiscoveredAssetLinkSource } from './networkTypes';
 
 export type AssetDetail = DiscoveredAsset & {
   openPorts?: OpenPortEntry[];
   osFingerprint?: string;
   snmpData?: Record<string, string>;
   linkedDeviceId?: string | null;
+  linkSource?: DiscoveredAssetLinkSource | null;
   label?: string | null;
   notes?: string | null;
   tags?: string[];
@@ -37,6 +40,7 @@ type AssetDetailModalProps = {
   devices?: { id: string; name: string; online?: boolean }[];
   onClose: () => void;
   onLinked?: (assetId: string, deviceId: string) => void;
+  onUnlinked?: (assetId: string) => void;
   onDeleted?: (assetId: string) => void;
   onUpdated?: (assetId: string) => void;
 };
@@ -48,6 +52,7 @@ export default function AssetDetailModal({
   devices = [],
   onClose,
   onLinked,
+  onUnlinked,
   onDeleted,
   onUpdated
 }: AssetDetailModalProps) {
@@ -60,6 +65,7 @@ export default function AssetDetailModal({
   const [editLabel, setEditLabel] = useState('');
   const [editNotes, setEditNotes] = useState('');
   const [editTags, setEditTags] = useState('');
+  const [editType, setEditType] = useState<DiscoveredAssetType>(asset?.type ?? 'unknown');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string>();
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -88,6 +94,7 @@ export default function AssetDetailModal({
     setEditLabel(asset?.label ?? '');
     setEditNotes(asset?.notes ?? '');
     setEditTags(asset?.tags?.join(', ') ?? '');
+    setEditType(asset?.type ?? 'unknown');
     setSaveError(undefined);
     setSaveSuccess(false);
     setProxyEnabled((asset as any)?.proxyEnabled ?? false);
@@ -146,6 +153,39 @@ export default function AssetDetailModal({
     }
   };
 
+  // The Unlink button only renders for manual links (see render guard below) and
+  // the server independently rejects non-manual unlinks; this handler guards only
+  // that a link exists. Mirrors handleLink's inline success/error messaging, but
+  // surfaces the server's actual error text (e.g. a stale modal hitting 403/404).
+  const handleUnlink = async () => {
+    if (!asset?.linkedDeviceId) return;
+    if (typeof window !== 'undefined' && !window.confirm('Unlink this device?')) {
+      return;
+    }
+
+    try {
+      setLinking(true);
+      setLinkError(undefined);
+      setLinkSuccess(undefined);
+      const response = await fetchWithAuth(`/discovery/assets/${asset.id}/link`, {
+        method: 'DELETE'
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(extractApiError(body, 'Failed to unlink asset'));
+      }
+
+      setSelectedDevice('');
+      setLinkSuccess('Device unlinked.');
+      onUnlinked?.(asset.id);
+    } catch (err) {
+      setLinkError(err instanceof Error ? err.message : 'An error occurred');
+    } finally {
+      setLinking(false);
+    }
+  };
+
   const handleDelete = async () => {
     if (!asset) return;
     const name = asset.hostname || asset.ip;
@@ -187,11 +227,36 @@ export default function AssetDetailModal({
         body: JSON.stringify({
           label: editLabel || null,
           notes: editNotes || null,
-          tags
+          tags,
+          ...(editType !== asset.type ? { assetType: editType } : {})
         })
       });
       if (!response.ok) {
-        throw new Error('Failed to save asset info');
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error || 'Failed to save asset info');
+      }
+      setSaveSuccess(true);
+      onUpdated?.(asset.id);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'An error occurred');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleResetType = async () => {
+    if (!asset) return;
+    try {
+      setSaving(true);
+      setSaveError(undefined);
+      setSaveSuccess(false);
+      const response = await fetchWithAuth(`/discovery/assets/${asset.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ resetTypeToAuto: true })
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error || 'Failed to reset type');
       }
       setSaveSuccess(true);
       onUpdated?.(asset.id);
@@ -419,6 +484,31 @@ export default function AssetDetailModal({
                   />
                 </div>
                 <div>
+                  <label className="text-xs font-medium text-muted-foreground">Asset Type</label>
+                  <div className="mt-1 flex items-center gap-2">
+                    <select
+                      data-testid="asset-modal-type-select"
+                      className="rounded-md border bg-background px-2 py-1 text-sm"
+                      value={editType}
+                      onChange={(e) => setEditType(e.target.value as DiscoveredAssetType)}
+                    >
+                      {(Object.keys(typeConfig) as DiscoveredAssetType[]).map((t) => (
+                        <option key={t} value={t}>{typeConfig[t].label}</option>
+                      ))}
+                    </select>
+                    {asset.typeSource === 'manual' && (
+                      <button
+                        type="button"
+                        data-testid="asset-modal-type-reset"
+                        className="text-xs text-muted-foreground underline hover:text-foreground"
+                        onClick={() => void handleResetType()}
+                      >
+                        Reset to auto-detected
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div>
                   <label className="text-xs font-medium text-muted-foreground">Notes / Description</label>
                   <textarea
                     value={editNotes}
@@ -472,6 +562,7 @@ export default function AssetDetailModal({
               </p>
               <div className="mt-3 flex items-center gap-3">
                 <select
+                  data-testid="asset-modal-link-select"
                   value={selectedDevice}
                   onChange={event => setSelectedDevice(event.target.value)}
                   className="h-9 flex-1 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -491,6 +582,17 @@ export default function AssetDetailModal({
                 >
                   {linking ? 'Linking...' : 'Link asset'}
                 </button>
+                {asset.linkedDeviceId && isManualLink(asset.linkSource) && (
+                  <button
+                    type="button"
+                    data-testid="asset-modal-unlink"
+                    onClick={handleUnlink}
+                    disabled={linking}
+                    className="h-9 rounded-md border border-destructive/40 px-4 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    {linking ? 'Working...' : 'Unlink'}
+                  </button>
+                )}
               </div>
               {linkSuccess && (
                 <div className="mt-3 rounded-md border border-success/40 bg-success/10 px-3 py-2 text-xs text-success">
