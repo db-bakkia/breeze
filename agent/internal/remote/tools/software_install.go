@@ -52,6 +52,32 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 		return NewErrorResult(err, time.Since(startTime).Milliseconds())
 	}
 
+	// Detection rules (#2022): evaluated against the device's real state so the
+	// reported status reflects whether the app is actually present rather than
+	// just the installer exit code.
+	detectionRules := parseDetectionRules(payload)
+	forceReinstall := GetPayloadBool(payload, "forceReinstall", false)
+
+	// Pre-install gate: when a detection rule is configured and the package is
+	// already present, skip the download+install entirely (unless the deployment
+	// forces a reinstall). Unsupported rule types on this platform can't be
+	// evaluated, so we fall through and install rather than guessing.
+	if len(detectionRules) > 0 && !forceReinstall {
+		if pre := EvaluateDetectionRules(detectionRules); pre.Supported && pre.Detected {
+			return NewSuccessResult(map[string]any{
+				"softwareName":       softwareName,
+				"version":            version,
+				"fileType":           fileType,
+				"action":             "install",
+				"success":            true,
+				"skipped":            true,
+				"detectionPerformed": true,
+				"detectionSatisfied": true,
+				"detail":             "already installed; " + pre.Detail,
+			}, time.Since(startTime).Milliseconds())
+		}
+	}
+
 	if err := validateDownloadURL(downloadUrl); err != nil {
 		return NewErrorResult(err, time.Since(startTime).Milliseconds())
 	}
@@ -113,7 +139,48 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 	if outputTruncated {
 		successPayload["outputTruncated"] = true
 	}
-	return NewSuccessResult(successPayload, time.Since(startTime).Milliseconds())
+
+	return applyPostInstallDetection(successPayload, exitCode, output, detectionRules, time.Since(startTime).Milliseconds())
+}
+
+// applyPostInstallDetection decides the final install result from the device's
+// REAL state when detection rules are configured (#2022). The installer's exit
+// code alone is not trusted: an installer can exit 0 yet leave nothing behind.
+//
+// Three outcomes:
+//   - supported + detected   → success (the install verified).
+//   - supported + !detected  → failed ("reported success but detection rule
+//     was not satisfied") — the marquee guarantee of this feature.
+//   - unsupported on platform → keep the exit-code success result and note that
+//     detection was not performed (never silently flip to pass/fail).
+//
+// With no rules it is a plain exit-code success. successPayload is mutated with
+// detection metadata for the success/unsupported paths.
+func applyPostInstallDetection(successPayload map[string]any, exitCode int, output string, rules []DetectionRule, durationMs int64) CommandResult {
+	if len(rules) == 0 {
+		return NewSuccessResult(successPayload, durationMs)
+	}
+
+	post := EvaluateDetectionRules(rules)
+	if !post.Supported {
+		successPayload["detectionPerformed"] = false
+		successPayload["detail"] = post.Detail
+		return NewSuccessResult(successPayload, durationMs)
+	}
+
+	successPayload["detectionPerformed"] = true
+	successPayload["detectionSatisfied"] = post.Detected
+	if !post.Detected {
+		return CommandResult{
+			Status:     "failed",
+			ExitCode:   exitCode,
+			Stdout:     output,
+			Error:      "installer reported success but detection rule was not satisfied: " + post.Detail,
+			DurationMs: durationMs,
+		}
+	}
+	successPayload["detail"] = post.Detail
+	return NewSuccessResult(successPayload, durationMs)
 }
 
 func validateInstallInputs(fileName, fileType, checksum, silentInstallArgs, softwareName, version string) (string, string, string, string, string, string, error) {
@@ -335,16 +402,29 @@ func executeInstaller(localPath, fileType, silentInstallArgs string) (int, strin
 		}
 	}
 
-	// MSI exit codes: 0 = success, 3010 = success pending reboot
-	if fileType == "msi" && (exitCode == 0 || exitCode == 3010) {
+	if installerExitIndicatesSuccess(fileType, exitCode) {
 		return exitCode, procoutput.BytesToUTF8(output), nil
 	}
 
-	if exitCode != 0 {
-		return exitCode, procoutput.BytesToUTF8(output), fmt.Errorf("installer exited with code %d", exitCode)
-	}
+	return exitCode, procoutput.BytesToUTF8(output), fmt.Errorf("installer exited with code %d", exitCode)
+}
 
-	return 0, procoutput.BytesToUTF8(output), nil
+// installerExitIndicatesSuccess reports whether an installer exit code means the
+// install succeeded. 0 is universal success. 3010 (ERROR_SUCCESS_REBOOT_REQUIRED)
+// and 1641 (ERROR_SUCCESS_REBOOT_INITIATED) are Windows installer "success, a
+// reboot is pending/underway" codes returned by both MSI and many EXE installers.
+// Previously only MSI 3010 was honored, so a reboot-pending EXE install — and any
+// MSI returning 1641 — was wrongly reported as failed (#2022).
+func installerExitIndicatesSuccess(fileType string, exitCode int) bool {
+	if exitCode == 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(fileType)) {
+	case "exe", "msi":
+		return exitCode == 3010 || exitCode == 1641
+	default:
+		return false
+	}
 }
 
 func buildMSIExecArgs(localPath, silentInstallArgs string) []string {
