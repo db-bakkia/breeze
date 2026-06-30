@@ -15,6 +15,8 @@ interface Props {
   compact?: boolean;
   iconOnly?: boolean;
   disabled?: boolean;
+  /** Tooltip shown while the button is disabled via the `disabled` prop (e.g. "Device is offline"). */
+  disabledTitle?: string;
   isHeadless?: boolean;
   desktopAccess?: DesktopAccessState | null;
   remoteAccessPolicy?: RemoteAccessPolicy | null;
@@ -82,7 +84,7 @@ function desktopAccessUnavailableReason(
   }
 }
 
-export default function ConnectDesktopButton({ deviceId, className = '', compact = false, iconOnly = false, disabled = false, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null }: Props) {
+export default function ConnectDesktopButton({ deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null }: Props) {
   const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback' | 'denied'>('idle');
   const [error, setError] = useState<string | null>(null);
   // Populated when the VNC auto-fallback path times out — carries the info needed
@@ -99,6 +101,13 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       if (autoDismissTimerRef.current) clearTimeout(autoDismissTimerRef.current);
     };
   }, []);
+
+  // Clear any stale "Connection failed" error once the button becomes disabled
+  // (e.g. the device just went offline). Otherwise the leftover error label and
+  // title would mask the `disabledTitle` ("Device is offline") tooltip.
+  useEffect(() => {
+    if (disabled) setError(null);
+  }, [disabled]);
 
   const endSession = useCallback((sessionId: string) => {
     fetchWithAuth(`/remote/sessions/${sessionId}/end`, { method: 'POST' }).catch(() => {});
@@ -682,7 +691,7 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
           type="button"
           onClick={handleConnect}
           disabled={disabled || status === 'creating' || status === 'launching'}
-          title={error || 'Connect Desktop'}
+          title={error || (disabled ? disabledTitle : undefined) || 'Connect Desktop'}
           className={`flex h-8 w-8 items-center justify-center rounded-md transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
         >
           {status === 'creating' || status === 'launching' ? (
@@ -703,8 +712,8 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
         <button
           type="button"
           onClick={handleConnect}
-          disabled={status === 'creating' || status === 'launching'}
-          title={error || undefined}
+          disabled={disabled || status === 'creating' || status === 'launching'}
+          title={error || (disabled ? disabledTitle : undefined)}
           className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
         >
           <Monitor className="h-4 w-4" />
@@ -724,8 +733,8 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       <button
         type="button"
         onClick={handleConnect}
-        disabled={status === 'creating' || status === 'launching'}
-        title={error || undefined}
+        disabled={disabled || status === 'creating' || status === 'launching'}
+        title={error || (disabled ? disabledTitle : undefined)}
         className={`flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${error ? 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-red-950 dark:text-red-400 dark:hover:bg-red-900' : 'bg-background hover:bg-muted'}`}
       >
         <Monitor className="h-4 w-4" />

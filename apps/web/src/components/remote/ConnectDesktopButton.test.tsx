@@ -122,3 +122,80 @@ describe('ConnectDesktopButton — launcher skip-reason toast', () => {
     expect(toastMock).not.toHaveBeenCalled();
   });
 });
+
+describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
+  beforeEach(() => {
+    _resetToastQueueForTests();
+    fetchMock.mockReset();
+    toastMock.mockReset();
+  });
+
+  // The full and compact render variants previously dropped the `disabled` prop
+  // on the floor (only iconOnly honored it), so an offline device's button
+  // stayed clickable and fired a doomed POST /remote/sessions. These assert all
+  // three variants now honor `disabled` and surface `disabledTitle`.
+  for (const variant of ['full', 'compact', 'iconOnly'] as const) {
+    it(`honors disabled + disabledTitle in the ${variant} variant`, () => {
+      render(
+        <ConnectDesktopButton
+          deviceId="dev-off"
+          disabled
+          disabledTitle="Device is offline"
+          {...(variant === 'compact' ? { compact: true } : {})}
+          {...(variant === 'iconOnly' ? { iconOnly: true } : {})}
+        />,
+      );
+
+      const btn = screen.getByRole('button');
+      expect(btn).toBeDisabled();
+      expect(btn).toHaveAttribute('title', 'Device is offline');
+    });
+
+    it(`does NOT fire a session request when clicked while disabled (${variant} variant)`, () => {
+      render(
+        <ConnectDesktopButton
+          deviceId="dev-off"
+          disabled
+          disabledTitle="Device is offline"
+          {...(variant === 'compact' ? { compact: true } : {})}
+          {...(variant === 'iconOnly' ? { iconOnly: true } : {})}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button'));
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+
+  it('stays enabled when not disabled', () => {
+    render(<ConnectDesktopButton deviceId="dev-on" disabledTitle="Device is offline" />);
+    expect(screen.getByRole('button', { name: /connect desktop/i })).not.toBeDisabled();
+  });
+
+  it('clears a stale "Connection failed" error and shows the offline tooltip when the device goes offline', async () => {
+    // GET /devices/:id (no launcher), then the sessions POST fails — drives the
+    // button into its error state while it is still enabled.
+    fetchMock.mockResolvedValueOnce(jsonRes({
+      desktopAccess: null,
+      hasRemoteAccessLauncher: false,
+      remoteAccessLaunchSkipReason: 'no_provider_configured',
+    }));
+    fetchMock.mockResolvedValue(jsonRes({ error: 'Device is not online' }, false));
+
+    const { rerender } = render(
+      <ConnectDesktopButton deviceId="dev-x" disabledTitle="Device is offline" />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /connection failed/i })).toBeInTheDocument(),
+    );
+
+    // Device flips offline → disabled. The stale error must clear so the offline
+    // tooltip is visible rather than the leftover "Connection failed" title.
+    rerender(<ConnectDesktopButton deviceId="dev-x" disabled disabledTitle="Device is offline" />);
+    const btn = screen.getByRole('button');
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('title', 'Device is offline');
+    expect(screen.queryByText(/connection failed/i)).toBeNull();
+  });
+});
