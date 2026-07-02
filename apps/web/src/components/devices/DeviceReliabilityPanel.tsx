@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, AlertTriangle, ChevronDown, Cpu, RefreshCw, Settings, ShieldCheck, Sparkles, Wrench, XCircle } from 'lucide-react';
+import { Activity, AlertTriangle, ChevronDown, Cpu, RefreshCw, Settings, ShieldCheck, Sparkles, Wrench } from 'lucide-react';
 
 import type { AiPageContext } from '@breeze/shared';
-import { runAction, handleActionError } from '../../lib/runAction';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
 import { useMlFeatureFlags } from '../../hooks/useMlFeatureFlags';
-import { useClickOutside } from '../../hooks/useClickOutside';
 import { useAiStore } from '../../stores/aiStore';
 import HelpTooltip from '../shared/HelpTooltip';
 
@@ -76,18 +74,13 @@ function formatCount(value: number): string {
 }
 
 // Observed device age in whole days, or null when enrollment time is unknown.
+// Used only to add a "windows span less than 30d" tooltip on young devices —
+// labels always use the fixed window.
 function deviceAgeDays(enrolledAt?: string | null): number | null {
   if (!enrolledAt) return null;
   const ms = Date.parse(enrolledAt);
   if (Number.isNaN(ms)) return null;
   return Math.max(0, Math.floor((Date.now() - ms) / DAY_MS));
-}
-
-// Relabel a fixed window ("30d") to the actually-observed age on a device younger
-// than the window ("since enroll · 13d"), so counts aren't read as a full month.
-function windowLabel(windowDays: number, ageDays: number | null): string {
-  if (ageDays !== null && ageDays < windowDays) return `since enroll · ${ageDays}d`;
-  return `${windowDays}d`;
 }
 
 type DeviceReliabilityPanelProps = {
@@ -101,17 +94,6 @@ const issueLabels: Record<ReliabilityTopIssue['type'], string> = {
   hardware: 'Hardware errors',
   uptime: 'Uptime',
 };
-
-const OUTCOME_ITEMS: Array<{
-  outcome: 'failure_confirmed' | 'replaced' | 'false_alarm';
-  label: string;
-  Icon: typeof AlertTriangle;
-  iconClass: string;
-}> = [
-  { outcome: 'failure_confirmed', label: 'Device failed', Icon: AlertTriangle, iconClass: 'text-destructive' },
-  { outcome: 'replaced', label: 'Device replaced', Icon: Wrench, iconClass: 'text-muted-foreground' },
-  { outcome: 'false_alarm', label: 'False alarm', Icon: XCircle, iconClass: 'text-muted-foreground' },
-];
 
 function scoreClass(score: number): string {
   if (score <= 50) return 'text-destructive';
@@ -144,6 +126,18 @@ function topDragLabel(snapshot: ReliabilitySnapshot): string | null {
   return issue ? issueLabels[issue.type] : null;
 }
 
+// 30-day raw count backing a fault factor, for the "Biggest drag" headline stat.
+// Uptime has no count (it's a percentage) and unknown factors return null.
+function factorCount30d(snapshot: ReliabilitySnapshot, factor: string): number | null {
+  switch (factor) {
+    case 'crashes': return snapshot.crashCount30d;
+    case 'hangs': return snapshot.hangCount30d;
+    case 'serviceFailures': return snapshot.serviceFailureCount30d;
+    case 'hardwareErrors': return snapshot.hardwareErrorCount30d;
+    default: return null;
+  }
+}
+
 function buildReliabilitySeedPrompt(snapshot: ReliabilitySnapshot, drivers: ReliabilityDriver[]): string {
   const mtbf = snapshot.mtbfHours === null ? 'unknown' : `${Math.round(snapshot.mtbfHours)}h`;
   const driverText = drivers.length > 0
@@ -164,17 +158,77 @@ function formatDate(value: string): string {
   return formatDateTime(date, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function formatEvidenceKey(value: string): string {
-  return value
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
-    .replace(/_/g, ' ')
-    .toLowerCase();
+// Points a factor currently contributes to the overall score (weight × health).
+// Display rounds to whole points; exact value goes in the row's title attribute.
+function earnedPoints(driver: ReliabilityDriver): number {
+  return (driver.weight * driver.score) / 100;
 }
 
-function formatEvidenceValue(key: string, value: number): string {
-  if (key.toLowerCase().includes('uptime')) return `${value.toFixed(1)}%`;
-  return Number.isInteger(value) ? formatCount(value) : value.toFixed(1);
+// One human-readable evidence line per factor row, window-aware ("11 in last 7d
+// · 24 in 30d · 0 recovered"), replacing the old machine-generated key dump
+// ("service failure count7d"). Reads the driver's evidence payload with the
+// snapshot's headline counts as fallback so legacy payload shapes still render.
+function factorEvidenceText(
+  driver: ReliabilityDriver,
+  snapshot: ReliabilitySnapshot,
+  windowPhrase: string
+): string | null {
+  const evidence = driver.evidence;
+  const pick = (...keys: string[]): number | null => {
+    for (const key of keys) {
+      const value = evidence[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+    }
+    return null;
+  };
+
+  const parts: string[] = [];
+  switch (driver.factor) {
+    case 'crashes': {
+      const count30 = pick('crashCount30d') ?? snapshot.crashCount30d;
+      const count7 = pick('crashCount7d');
+      parts.push(`${formatCount(count30)} ${windowPhrase}`);
+      if (count7 !== null) parts.push(`${formatCount(count7)} in last 7d`);
+      break;
+    }
+    case 'hangs': {
+      const count30 = pick('hangCount30d') ?? snapshot.hangCount30d;
+      const unresolved = pick('unresolvedHangCount30d');
+      parts.push(`${formatCount(count30)} ${windowPhrase}`);
+      if (unresolved) parts.push(`${formatCount(unresolved)} unresolved`);
+      break;
+    }
+    case 'serviceFailures': {
+      const count30 = pick('serviceFailureCount30d', 'serviceFailure30d') ?? snapshot.serviceFailureCount30d;
+      const count7 = pick('serviceFailureCount7d');
+      const recovered = pick('recoveredServiceCount30d');
+      const self = pick('selfServiceFailureCount30d');
+      parts.push(`${formatCount(count30)} ${windowPhrase}`);
+      if (count7 !== null) parts.push(`${formatCount(count7)} in last 7d`);
+      if (recovered !== null) parts.push(`${formatCount(recovered)} recovered`);
+      if (self) parts.push(`${formatCount(self)} from Breeze services, not scored`);
+      break;
+    }
+    case 'hardwareErrors': {
+      const count30 = pick('hardwareErrorCount30d') ?? snapshot.hardwareErrorCount30d;
+      const critical = pick('criticalHardwareCount30d');
+      parts.push(`${formatCount(count30)} ${windowPhrase}`);
+      if (critical) parts.push(`${formatCount(critical)} critical`);
+      break;
+    }
+    case 'uptime': {
+      const uptime30 = pick('uptime30d') ?? snapshot.uptime30d;
+      parts.push(`${uptime30.toFixed(1)}% ${windowPhrase}`);
+      break;
+    }
+    default:
+      return null;
+  }
+  return parts.join(' · ');
 }
+
+// Factors whose raw events appear in the offenders drill-down.
+const OFFENDER_FACTORS = new Set(['serviceFailures', 'hardwareErrors', 'hangs']);
 
 function formatOffenderWhen(value: string | null): string | null {
   if (!value) return null;
@@ -234,7 +288,6 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
   const [snapshot, setSnapshot] = useState<ReliabilitySnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
-  const [labeling, setLabeling] = useState<string | null>(null);
   const reliabilityDisabled = mlFlags.isDisabled('ml.device_reliability.enabled');
 
   const fetchReliability = useCallback(async () => {
@@ -269,6 +322,20 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
 
   const drivers = useMemo(() => (snapshot?.drivers ?? []).slice(0, 3), [snapshot?.drivers]);
 
+  // Every factor, problems first (lost points desc, then weight desc so a
+  // 0-weight uptime row lands last). The API pre-sorts by lost points; the
+  // re-sort here is a defensive no-op for well-formed payloads.
+  const factorRows = useMemo(() => {
+    const list = [...(snapshot?.drivers ?? [])];
+    list.sort((left, right) => (right.lostPoints - left.lostPoints) || (right.weight - left.weight));
+    return list;
+  }, [snapshot?.drivers]);
+  const scoredFactors = useMemo(() => factorRows.filter((driver) => driver.weight > 0), [factorRows]);
+  // The segmented bar only reads correctly when the segments account for
+  // (essentially) the whole score; legacy snapshots with partial driver lists
+  // keep the plain single-fill bar.
+  const scoredWeightTotal = scoredFactors.reduce((sum, driver) => sum + driver.weight, 0);
+
   const startDeviceTask = useAiStore((s) => s.startDeviceTask);
 
   const askAi = useCallback(() => {
@@ -282,10 +349,6 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
     };
     void startDeviceTask(deviceId, ctx, buildReliabilitySeedPrompt(snapshot, drivers));
   }, [snapshot, deviceId, drivers, startDeviceTask]);
-
-  const [outcomeMenuOpen, setOutcomeMenuOpen] = useState(false);
-  const outcomeMenuRef = useRef<HTMLDivElement>(null);
-  useClickOutside(outcomeMenuOpen, outcomeMenuRef, () => setOutcomeMenuOpen(false));
 
   // Offenders drill-down (issue #1907): lazily fetched on first expand so the
   // initial panel render stays a single request and healthy devices pay nothing.
@@ -338,33 +401,12 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
     if (next && !offendersFetchedRef.current) void loadOffenders();
   }, [offendersOpen, loadOffenders]);
 
-  function handleOutcome(outcome: 'failure_confirmed' | 'replaced' | 'false_alarm') {
-    setOutcomeMenuOpen(false);
-    void submitFeedback(outcome);
-  }
-
-  async function submitFeedback(outcome: 'failure_confirmed' | 'replaced' | 'false_alarm') {
-    setLabeling(outcome);
-    try {
-      await runAction({
-        request: () => fetchWithAuth(`/reliability/${deviceId}/feedback`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ outcome, snapshotComputedAt: snapshot?.computedAt }),
-        }),
-        errorFallback: 'Could not save reliability feedback',
-        successMessage: outcome === 'false_alarm'
-          ? 'False alarm label saved'
-          : outcome === 'replaced'
-            ? 'Replacement label saved'
-            : 'Failure label saved',
-      });
-    } catch (err) {
-      handleActionError(err, 'Could not save reliability feedback');
-    } finally {
-      setLabeling(null);
-    }
-  }
+  // Open (never close) the drill-down — used by the per-factor "details" links.
+  const expandOffenders = useCallback(() => {
+    if (offendersOpen) return;
+    setOffendersOpen(true);
+    if (!offendersFetchedRef.current) void loadOffenders();
+  }, [offendersOpen, loadOffenders]);
 
   if (loading) {
     return (
@@ -423,13 +465,21 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
   }
 
   const ageDays = deviceAgeDays(snapshot.enrolledAt);
-  const uptimeWindow = windowLabel(OFFENDER_WINDOW_DAYS, ageDays);
-  // Phrase the drill-down window the same way as the tiles: observed age on a
-  // young device, otherwise the fixed window.
-  const offenderWindowText =
-    ageDays !== null && ageDays < OFFENDER_WINDOW_DAYS
-      ? `since enroll (${ageDays}d)`
-      : `last ${OFFENDER_WINDOW_DAYS} days`;
+  // Workstation-profile devices score uptime at 0% weight (they sleep/reboot by
+  // design), so a perfect uptime% next to a low score reads as a contradiction —
+  // "why is the score low when uptime is 100%?". When uptime carries no weight
+  // AND some factor is actually losing points, give the headline slot to that
+  // factor instead. drivers are already sorted by lost points (API-side).
+  const uptimeDriver = (snapshot.drivers ?? []).find((driver) => driver.factor === 'uptime');
+  const topDrag = (snapshot.drivers ?? [])[0];
+  const topDragCount = topDrag ? factorCount30d(snapshot, topDrag.factor) : null;
+  const showTopDragStat = uptimeDriver?.weight === 0 && topDrag !== undefined && topDrag.lostPoints > 0;
+  const offenderWindowText = `last ${OFFENDER_WINDOW_DAYS} days`;
+  // Short form for inline evidence: "24 in 30d".
+  const windowPhrase = `in ${OFFENDER_WINDOW_DAYS}d`;
+  // Young devices haven't lived a full window yet; a tooltip carries that
+  // context instead of relabeling every window (the old "since enroll · Nd").
+  const youngDevice = ageDays !== null && ageDays < OFFENDER_WINDOW_DAYS;
   const offenderEventTotal =
     snapshot.serviceFailureCount30d + snapshot.hardwareErrorCount30d + snapshot.hangCount30d;
 
@@ -472,17 +522,34 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
               <div className="text-xs text-muted-foreground">Trend</div>
               <div className="text-sm font-medium capitalize">{snapshot.trendDirection}</div>
             </div>
-            <div>
-              <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                <span data-testid="reliability-uptime-window">{uptimeWindow} uptime</span>
-                {ageDays !== null && ageDays < OFFENDER_WINDOW_DAYS && (
+            {showTopDragStat && topDrag ? (
+              <div>
+                <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <span data-testid="reliability-top-drag">Biggest drag</span>
                   <HelpTooltip
-                    text={`This device enrolled ${ageDays} day${ageDays === 1 ? '' : 's'} ago, so the ${OFFENDER_WINDOW_DAYS}-day windows only span its lifetime so far.`}
+                    text={`Uptime isn't scored for this device type (workstations sleep and reboot by design), so the factor costing the most points is shown instead. ${topDrag.label}: health ${topDrag.score}/100, ${topDrag.weight}% of the score.`}
                   />
-                )}
+                </div>
+                <div className="text-sm font-medium">
+                  {topDrag.label}
+                  {topDragCount !== null && (
+                    <span className="text-muted-foreground"> · {formatCount(topDragCount)} {windowPhrase}</span>
+                  )}
+                </div>
               </div>
-              <div className="text-sm font-medium tabular-nums">{snapshot.uptime30d.toFixed(1)}%</div>
-            </div>
+            ) : (
+              <div>
+                <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <span data-testid="reliability-uptime-window">{OFFENDER_WINDOW_DAYS}d uptime</span>
+                  {youngDevice && (
+                    <HelpTooltip
+                      text={`This device enrolled ${ageDays} day${ageDays === 1 ? '' : 's'} ago, so the ${OFFENDER_WINDOW_DAYS}-day windows only span its lifetime so far.`}
+                    />
+                  )}
+                </div>
+                <div className="text-sm font-medium tabular-nums">{snapshot.uptime30d.toFixed(1)}%</div>
+              </div>
+            )}
             <div>
               <div className="text-xs text-muted-foreground">MTBF</div>
               <div className="text-sm font-medium tabular-nums">
@@ -490,12 +557,38 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
               </div>
             </div>
           </div>
-          <div className="mt-3 h-2 rounded-full bg-muted">
+          {scoredWeightTotal >= 99 ? (
+            // Weight-segmented score bar: one segment per scored factor, segment
+            // width = factor weight, fill = factor health — the filled area IS
+            // the score, so the arithmetic is visible at a glance. Ordered to
+            // match the factor rows below (problems first).
             <div
-              className={`h-2 rounded-full ${scoreBarClass(snapshot.reliabilityScore)}`}
-              style={{ width: `${snapshot.reliabilityScore}%` }}
-            />
-          </div>
+              data-testid="reliability-score-bar-segmented"
+              role="img"
+              aria-label={`Score breakdown: ${scoredFactors
+                .map((driver) => `${driver.label} ${Math.round(earnedPoints(driver))} of ${Math.round(driver.weight)} points`)
+                .join(', ')}`}
+              className="mt-3 flex h-2 gap-px overflow-hidden rounded-full"
+            >
+              {scoredFactors.map((driver) => (
+                <div
+                  key={driver.factor}
+                  className="h-2 bg-muted"
+                  style={{ width: `${driver.weight}%` }}
+                  title={`${driver.label} — ${Math.round(earnedPoints(driver))} of ${Math.round(driver.weight)} pts (health ${driver.score}/100)`}
+                >
+                  <div className={`h-2 ${scoreBarClass(driver.score)}`} style={{ width: `${driver.score}%` }} />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-3 h-2 rounded-full bg-muted">
+              <div
+                className={`h-2 rounded-full ${scoreBarClass(snapshot.reliabilityScore)}`}
+                style={{ width: `${snapshot.reliabilityScore}%` }}
+              />
+            </div>
+          )}
           <p className="mt-2 text-xs text-muted-foreground">Updated {formatDate(snapshot.computedAt)}</p>
         </div>
 
@@ -509,89 +602,90 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
             <Sparkles className="h-4 w-4" />
             Ask AI about reliability
           </button>
-          <div ref={outcomeMenuRef} className="relative">
-            <button
-              type="button"
-              data-testid="reliability-outcome-trigger"
-              aria-haspopup="true"
-              aria-expanded={outcomeMenuOpen}
-              disabled={labeling !== null}
-              onClick={() => setOutcomeMenuOpen((o) => !o)}
-              className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              Mark outcome
-              <ChevronDown className="h-3.5 w-3.5" />
-            </button>
-
-            {outcomeMenuOpen && (
-              <div
-                role="menu"
-                data-testid="reliability-outcome-menu"
-                className="absolute right-0 top-9 z-30 w-64 rounded-md border bg-popover p-1 shadow-lg"
-              >
-                <p className="px-2 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                  Was this accurate?
-                </p>
-                {OUTCOME_ITEMS.map(({ outcome, label, Icon, iconClass }) => (
-                  <button
-                    key={outcome}
-                    type="button"
-                    data-testid={`reliability-outcome-${outcome}`}
-                    disabled={labeling !== null}
-                    onClick={() => handleOutcome(outcome)}
-                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    <Icon className={`h-4 w-4 shrink-0 ${iconClass}`} />
-                    {label}
-                  </button>
-                ))}
-                <hr className="my-1" />
-                <p className="px-2 pb-1.5 pt-0.5 text-xs text-muted-foreground">
-                  These train the reliability model — they don't change the device.
-                </p>
-              </div>
-            )}
-          </div>
+          {/* Outcome-feedback UI removed for now: the labels only feed a
+              precision evaluation endpoint no UI consumes, and there is no
+              learning loop for them to train yet. The POST /reliability/:id/
+              feedback route remains for when a real loop exists. */}
         </div>
       </div>
 
-      <div className="mt-5 grid gap-3 lg:grid-cols-3">
-        {drivers.length > 0 ? drivers.map((driver) => (
-          <div key={driver.factor} className="rounded-md border p-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium">{driver.label}</p>
-                <p className="text-xs text-muted-foreground">{driver.weight}% weight</p>
-              </div>
-              <span className="flex items-center gap-1">
-                <span className={`text-sm font-semibold tabular-nums ${scoreClass(driver.score)}`}>
-                  Health {driver.score}/100
-                </span>
-                <HelpTooltip
-                  text={`Factor health 0–100; 100 = no issues detected. Counts to ${driver.weight}% of the overall reliability score. The raw counts are listed below.`}
-                />
-              </span>
-            </div>
-            <div className="mt-3 space-y-1 text-xs text-muted-foreground">
-              {Object.entries(driver.evidence).slice(0, 3).map(([key, value]) => (
-                <div key={key} className="flex justify-between gap-3">
-                  <span className="truncate">{formatEvidenceKey(key)}</span>
-                  <span className="shrink-0 tabular-nums">{formatEvidenceValue(key, value)}</span>
+      {factorRows.length > 0 ? (
+        <div className="mt-5" data-testid="reliability-factors">
+          <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+            Score factors
+            <HelpTooltip
+              text={`Each factor's health (0–100) × its weight contributes points; the points add up to the ${snapshot.reliabilityScore} score. Values are rounded for display — hover a row for exact figures.`}
+            />
+          </div>
+          <div className="mt-1 divide-y divide-border/60">
+            {factorRows.map((driver) => {
+              const unweighted = driver.weight === 0;
+              const problem = !unweighted && driver.lostPoints > 0;
+              const evidenceText = factorEvidenceText(driver, snapshot, windowPhrase);
+              const showDetailsLink =
+                problem && OFFENDER_FACTORS.has(driver.factor) && offenderEventTotal > 0 && !offendersOpen;
+              return (
+                <div
+                  key={driver.factor}
+                  data-testid={`reliability-factor-${driver.factor}`}
+                  className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 py-2"
+                  title={
+                    unweighted
+                      ? `${driver.label} — not scored for this device type`
+                      : `${driver.label} — health ${driver.score}/100, earns ${earnedPoints(driver).toFixed(1)} of ${driver.weight} points`
+                  }
+                >
+                  <span className={`w-36 shrink-0 text-sm font-medium ${problem ? '' : 'text-muted-foreground'}`}>
+                    {driver.label}
+                  </span>
+                  <span className="min-w-0 flex-1 text-xs text-muted-foreground">
+                    {unweighted ? (
+                      <>Not scored for this device type{evidenceText ? ` — ${evidenceText}` : ''}</>
+                    ) : problem ? (
+                      <>
+                        {evidenceText}
+                        {showDetailsLink && (
+                          <button
+                            type="button"
+                            data-testid={`reliability-factor-details-${driver.factor}`}
+                            onClick={expandOffenders}
+                            className="ml-2 underline decoration-dotted underline-offset-2 hover:text-foreground"
+                          >
+                            details
+                          </button>
+                        )}
+                      </>
+                    ) : driver.factor === 'uptime' ? (
+                      evidenceText
+                    ) : (
+                      `None ${windowPhrase}`
+                    )}
+                  </span>
+                  <span
+                    className={`shrink-0 text-sm font-semibold tabular-nums ${
+                      unweighted ? 'text-muted-foreground/70' : problem ? scoreClass(driver.score) : 'text-muted-foreground'
+                    }`}
+                  >
+                    {unweighted ? '—' : `${Math.round(earnedPoints(driver))} / ${Math.round(driver.weight)} pts`}
+                  </span>
                 </div>
-              ))}
-              {Object.keys(driver.evidence).length === 0 && <span>No factor detail</span>}
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="mt-5 grid gap-3 lg:grid-cols-3">
+          {snapshot.topIssues.slice(0, 3).map((issue) => (
+            <div key={issue.type} className="rounded-md border p-3">
+              <p className="text-sm font-medium">{issueLabels[issue.type]}</p>
+              <p className="mt-1 text-xs capitalize text-muted-foreground">{issue.severity}</p>
+              <p className="mt-3 text-lg font-semibold tabular-nums" title={issue.count.toLocaleString()}>
+                {formatCount(issue.count)}
+              </p>
             </div>
-          </div>
-        )) : snapshot.topIssues.slice(0, 3).map((issue) => (
-          <div key={issue.type} className="rounded-md border p-3">
-            <p className="text-sm font-medium">{issueLabels[issue.type]}</p>
-            <p className="mt-1 text-xs capitalize text-muted-foreground">{issue.severity}</p>
-            <p className="mt-3 text-lg font-semibold tabular-nums" title={issue.count.toLocaleString()}>
-              {formatCount(issue.count)}
-            </p>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
 
       {offenderEventTotal > 0 && (
         <div className="mt-4 border-t pt-3">

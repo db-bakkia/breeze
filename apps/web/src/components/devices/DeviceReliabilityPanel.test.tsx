@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import DeviceReliabilityPanel from './DeviceReliabilityPanel';
@@ -36,10 +36,6 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
   }) as unknown as Response;
 
 describe('DeviceReliabilityPanel', () => {
-  const openOutcomeMenu = async () => {
-    fireEvent.click(await screen.findByTestId('reliability-outcome-trigger'));
-  };
-
   beforeEach(() => {
     vi.clearAllMocks();
     showToast.mockReset();
@@ -89,96 +85,26 @@ describe('DeviceReliabilityPanel', () => {
     expect(screen.getByText('44')).toBeTruthy();
     expect(screen.getByText('At risk')).toBeTruthy();
     expect(screen.getByText('Crashes')).toBeTruthy();
-    expect(screen.getByText('crash count30d')).toBeTruthy();
+    // Evidence is a human sentence ("4 in 30d"), not a machine key dump.
+    expect(screen.getByText(/4 in 30d/)).toBeTruthy();
+    // Points earned/available make the score arithmetic checkable: 20 × 25% = 5.
+    expect(screen.getByText('5 / 25 pts')).toBeTruthy();
     expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1');
   });
 
-  it('posts false alarm feedback through runAction', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({
-          snapshot: {
-            deviceId: 'dev-1',
-            reliabilityScore: 65,
-            trendDirection: 'stable',
-            trendConfidence: 0.4,
-            uptime30d: 99.1,
-            crashCount30d: 0,
-            hangCount30d: 1,
-            serviceFailureCount30d: 0,
-            hardwareErrorCount30d: 0,
-            mtbfHours: null,
-            topIssues: [],
-            drivers: [],
-            computedAt: '2026-06-18T12:00:00.000Z',
-          },
-          history: [],
-        }),
-      )
-      .mockResolvedValueOnce(makeJsonResponse({ success: true }));
+  // Outcome-feedback UI removed: the labels only fed an evaluation endpoint no
+  // UI consumes and there is no learning loop yet. The card must not render any
+  // outcome affordance.
+  it('renders no outcome-feedback affordance', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({ snapshot: baseSnapshot(), history: [] }),
+    );
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
-    await openOutcomeMenu();
-    expect(screen.getByTestId('reliability-outcome-menu')).toBeTruthy();
-    fireEvent.click(screen.getByTestId('reliability-outcome-false_alarm'));
-
-    await waitFor(() => {
-      expect(fetchWithAuthMock).toHaveBeenCalledWith(
-        '/reliability/dev-1/feedback',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            outcome: 'false_alarm',
-            snapshotComputedAt: '2026-06-18T12:00:00.000Z',
-          }),
-        }),
-      );
-    });
-    expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'success',
-      message: 'False alarm label saved',
-    }));
-
-    // Menu closes after selecting an outcome (close-on-select).
-    await waitFor(() => {
-      expect(screen.queryByTestId('reliability-outcome-menu')).toBeNull();
-    });
-  });
-
-  it('toasts an error when feedback submission fails (non-2xx)', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({
-          snapshot: {
-            deviceId: 'dev-1',
-            reliabilityScore: 65,
-            trendDirection: 'stable',
-            trendConfidence: 0.4,
-            uptime30d: 99.1,
-            crashCount30d: 0,
-            hangCount30d: 1,
-            serviceFailureCount30d: 0,
-            hardwareErrorCount30d: 0,
-            mtbfHours: null,
-            topIssues: [],
-            drivers: [],
-            computedAt: '2026-06-18T12:00:00.000Z',
-          },
-          history: [],
-        }),
-      )
-      .mockResolvedValueOnce(makeJsonResponse({ error: 'boom' }, false, 500));
-
-    render(<DeviceReliabilityPanel deviceId="dev-1" />);
-
-    await openOutcomeMenu();
-    fireEvent.click(screen.getByTestId('reliability-outcome-false_alarm'));
-
-    await waitFor(() => {
-      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
-    });
-    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+    await screen.findByText('Reliability');
+    expect(screen.queryByTestId('reliability-outcome-trigger')).toBeNull();
+    expect(screen.queryByText(/Mark outcome|Was this right/)).toBeNull();
   });
 
   it('renders an error state with a working Retry when the load fails', async () => {
@@ -299,7 +225,7 @@ describe('DeviceReliabilityPanel', () => {
     expect(screen.queryByTestId('reliability-outcome-trigger')).toBeNull();
   });
 
-  it('labels factor scores as Health N/100 (not a bare count)', async () => {
+  it('shows factor contribution as earned/available points with health in the row title', async () => {
     fetchWithAuthMock.mockResolvedValue(
       makeJsonResponse({
         snapshot: {
@@ -324,7 +250,11 @@ describe('DeviceReliabilityPanel', () => {
     );
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
-    expect(await screen.findByText('Health 100/100')).toBeInTheDocument();
+    expect(await screen.findByText('25 / 25 pts')).toBeInTheDocument();
+    const row = screen.getByTestId('reliability-factor-crashes');
+    expect(row.getAttribute('title')).toContain('health 100/100');
+    // A perfectly healthy fault factor reads as quiet reassurance, not a count dump.
+    expect(screen.getByText('None in 30d')).toBeInTheDocument();
   });
 
   it('shows an At-risk explainer tooltip naming the top drag factor', async () => {
@@ -425,12 +355,12 @@ describe('DeviceReliabilityPanel', () => {
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
     await screen.findByText('Service failures');
-    // The raw 1,228 is capped to 999+ in the tile; the exact value moves to the title attr.
-    expect(screen.getByText('999+')).toBeInTheDocument();
-    expect(screen.queryByText('1,228')).toBeNull();
+    // The raw 1,228 is capped to 999+ in the evidence line.
+    expect(screen.getByText(/999\+/)).toBeInTheDocument();
+    expect(screen.queryByText(/1,228/)).toBeNull();
   });
 
-  it('relabels fixed windows to observed age on a young device (issue #1907)', async () => {
+  it('keeps the fixed window label on a young device (age context lives in the tooltip)', async () => {
     const enrolledAt = new Date(Date.now() - 13 * 24 * 60 * 60 * 1000).toISOString();
     fetchWithAuthMock.mockResolvedValue(
       makeJsonResponse({ snapshot: baseSnapshot({ enrolledAt }), history: [] }),
@@ -439,7 +369,8 @@ describe('DeviceReliabilityPanel', () => {
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
     const windowLabel = await screen.findByTestId('reliability-uptime-window');
-    expect(windowLabel.textContent).toContain('since enroll · 13d');
+    expect(windowLabel.textContent).toBe('30d uptime');
+    expect(screen.queryByText(/since enroll/)).toBeNull();
   });
 
   it('keeps the full window label when the device is older than the window', async () => {
@@ -452,6 +383,203 @@ describe('DeviceReliabilityPanel', () => {
 
     const windowLabel = await screen.findByTestId('reliability-uptime-window');
     expect(windowLabel.textContent).toBe('30d uptime');
+  });
+
+  // Workstation profile: uptime is weighted 0, so a perfect uptime% next to a
+  // low score reads as a contradiction — the headline slot shows the factor
+  // actually costing points instead.
+  it('replaces the uptime headline with the biggest drag when uptime weight is 0', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({
+          serviceFailureCount30d: 24,
+          drivers: [
+            { factor: 'serviceFailures', label: 'Service failures', score: 0, weight: 21, lostPoints: 21, evidence: {} },
+            { factor: 'uptime', label: 'Uptime', score: 100, weight: 0, lostPoints: 0, evidence: { uptime30d: 100 } },
+          ],
+        }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    const drag = await screen.findByTestId('reliability-top-drag');
+    expect(drag.textContent).toBe('Biggest drag');
+    expect(screen.queryByTestId('reliability-uptime-window')).toBeNull();
+    // Appears in the headline stat and again in the factor row's evidence.
+    expect(screen.getAllByText(/24 in 30d/).length).toBeGreaterThan(0);
+  });
+
+  it('keeps the uptime headline on a 0-weight-uptime device when nothing is losing points', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({
+          reliabilityScore: 100,
+          drivers: [
+            { factor: 'crashes', label: 'Crashes', score: 100, weight: 36, lostPoints: 0, evidence: {} },
+            { factor: 'uptime', label: 'Uptime', score: 100, weight: 0, lostPoints: 0, evidence: { uptime30d: 100 } },
+          ],
+        }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    await screen.findByTestId('reliability-uptime-window');
+    expect(screen.queryByTestId('reliability-top-drag')).toBeNull();
+  });
+
+  it('keeps the uptime headline when uptime carries weight (infra profile)', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({
+          drivers: [
+            { factor: 'uptime', label: 'Uptime', score: 0, weight: 30, lostPoints: 30, evidence: { uptime30d: 42 } },
+            { factor: 'crashes', label: 'Crashes', score: 50, weight: 25, lostPoints: 12.5, evidence: {} },
+          ],
+        }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    await screen.findByTestId('reliability-uptime-window');
+    expect(screen.queryByTestId('reliability-top-drag')).toBeNull();
+  });
+
+  it('keeps the fixed 30d window phrasing on a young device (no since-enroll labels)', async () => {
+    const enrolledAt = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({
+          enrolledAt,
+          serviceFailureCount30d: 24,
+          drivers: [
+            { factor: 'serviceFailures', label: 'Service failures', score: 0, weight: 21, lostPoints: 21, evidence: {} },
+            { factor: 'uptime', label: 'Uptime', score: 100, weight: 0, lostPoints: 0, evidence: { uptime30d: 100 } },
+          ],
+        }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    await screen.findByTestId('reliability-top-drag');
+    // Appears in the headline stat and again in the factor row's evidence.
+    expect(screen.getAllByText(/24 in 30d/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/since enroll/)).toBeNull();
+  });
+
+  // The 63-score case from prod: services 0/21 + hardware 26/22 + crashes
+  // 100/36 + hangs 100/21 + uptime unweighted. The card must make that
+  // arithmetic visible instead of hiding the two healthy factors.
+  const workstationDrivers = () => [
+    { factor: 'serviceFailures', label: 'Service failures', score: 0, weight: 21, lostPoints: 21, evidence: { serviceFailureCount7d: 11, serviceFailureCount30d: 24, recoveredServiceCount30d: 0 } },
+    { factor: 'hardwareErrors', label: 'Hardware errors', score: 26, weight: 22, lostPoints: 16.28, evidence: { hardwareErrorCount7d: 2, hardwareErrorCount30d: 2 } },
+    { factor: 'crashes', label: 'Crashes', score: 100, weight: 36, lostPoints: 0, evidence: { crashCount30d: 0 } },
+    { factor: 'hangs', label: 'Application hangs', score: 100, weight: 21, lostPoints: 0, evidence: { hangCount30d: 0 } },
+    { factor: 'uptime', label: 'Uptime', score: 100, weight: 0, lostPoints: 0, evidence: { uptime30d: 100 } },
+  ];
+
+  it('shows all five factors so the score arithmetic is checkable', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({
+          reliabilityScore: 63,
+          serviceFailureCount30d: 24,
+          hardwareErrorCount30d: 2,
+          drivers: workstationDrivers(),
+        }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    await screen.findByTestId('reliability-factors');
+    // Problem rows carry humanized evidence with points lost visible.
+    expect(screen.getByText('0 / 21 pts')).toBeInTheDocument();
+    expect(screen.getByText(/24 in 30d · 11 in last 7d · 0 recovered/)).toBeInTheDocument();
+    // The previously-hidden healthy factors are now visible and quiet.
+    expect(screen.getByText('36 / 36 pts')).toBeInTheDocument();
+    expect(screen.getByText('21 / 21 pts')).toBeInTheDocument();
+    // Unweighted uptime is explained, not shown as a contradictory "100/100".
+    const uptimeRow = screen.getByTestId('reliability-factor-uptime');
+    expect(uptimeRow.textContent).toContain('Not scored for this device type');
+    expect(uptimeRow.textContent).toContain('—');
+  });
+
+  it('renders the weight-segmented score bar with one segment per scored factor', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({ reliabilityScore: 63, drivers: workstationDrivers() }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    const bar = await screen.findByTestId('reliability-score-bar-segmented');
+    // Four scored factors (uptime's 0-weight segment is omitted).
+    expect(bar.children).toHaveLength(4);
+    expect(bar.getAttribute('aria-label')).toContain('Service failures 0 of 21 points');
+    expect(bar.getAttribute('aria-label')).toContain('Crashes 36 of 36 points');
+  });
+
+  it('falls back to the plain score bar when driver weights do not cover the score', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        snapshot: baseSnapshot({
+          drivers: [
+            { factor: 'crashes', label: 'Crashes', score: 20, weight: 25, lostPoints: 20, evidence: {} },
+          ],
+        }),
+        history: [],
+      }),
+    );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    await screen.findByText('Reliability');
+    expect(screen.queryByTestId('reliability-score-bar-segmented')).toBeNull();
+  });
+
+  it('expands the offenders drill-down from a problem row details link', async () => {
+    fetchWithAuthMock
+      .mockResolvedValueOnce(
+        makeJsonResponse({
+          snapshot: baseSnapshot({
+            reliabilityScore: 63,
+            serviceFailureCount30d: 24,
+            drivers: workstationDrivers(),
+          }),
+          history: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeJsonResponse({
+          deviceId: 'dev-1',
+          days: 30,
+          offenders: {
+            services: [{ key: 'cplspcon', label: 'cplspcon', count: 12, lastOccurrence: '2026-07-01T11:54:59.000Z' }],
+            hardware: [],
+            hangs: [],
+          },
+        }),
+      );
+
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+
+    fireEvent.click(await screen.findByTestId('reliability-factor-details-serviceFailures'));
+
+    expect(await screen.findByText('cplspcon')).toBeInTheDocument();
+    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1/offenders');
+    // The link disappears once the drill-down is open (it can only open, not toggle).
+    expect(screen.queryByTestId('reliability-factor-details-serviceFailures')).toBeNull();
   });
 
   it('does not show the offenders drill-down when there are no offending events', async () => {
