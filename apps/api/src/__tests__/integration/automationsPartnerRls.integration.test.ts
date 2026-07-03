@@ -64,7 +64,7 @@ vi.mock('../../services/eventBus', async (importOriginal) => {
 });
 
 import { db, withDbAccessContext, type DbAccessContext } from '../../db';
-import { alertRules, alerts, alertTemplates, automationRuns, automations, devices, sites } from '../../db/schema';
+import { alertRules, alerts, alertTemplates, automationRunDeviceResults, automationRuns, automations, devices, sites } from '../../db/schema';
 import { queueEventTriggers } from '../../jobs/automationWorker';
 import { createAutomationRunRecord, executeAutomationRun } from '../../services/automationRuntime';
 import { resolvePolicyRemediationAutomationIdForOrg } from '../../services/policyEvaluationService';
@@ -498,6 +498,93 @@ describe('executeAutomationRun — partner-wide child-row org attribution (#2133
       .filter(([type]) => type === 'alert.triggered')
       .map(([, orgId]) => orgId);
     expect(alertEventOrgs.sort()).toEqual([orgA.id, orgB.id].sort());
+
+    // Per-device result rows (#2023): one per targeted device, each carrying
+    // that DEVICE's org (never the automation's NULL org), a terminal success
+    // status, and start/complete timestamps for duration display.
+    const deviceResultRows = await withDbAccessContext(SYSTEM_CTX, () =>
+      db
+        .select({
+          deviceId: automationRunDeviceResults.deviceId,
+          orgId: automationRunDeviceResults.orgId,
+          status: automationRunDeviceResults.status,
+          startedAt: automationRunDeviceResults.startedAt,
+          completedAt: automationRunDeviceResults.completedAt,
+          output: automationRunDeviceResults.output,
+        })
+        .from(automationRunDeviceResults)
+        .where(eq(automationRunDeviceResults.runId, run.id)),
+    );
+    expect(deviceResultRows).toHaveLength(2);
+    const resultByDevice = new Map(deviceResultRows.map((row) => [row.deviceId, row]));
+    for (const [deviceId, expectedOrg] of [[deviceA, orgA.id], [deviceB, orgB.id]] as const) {
+      const row = resultByDevice.get(deviceId);
+      expect(row).toBeDefined();
+      expect(row!.orgId).toBe(expectedOrg);
+      expect(row!.status).toBe('success');
+      expect(row!.startedAt).not.toBeNull();
+      expect(row!.completedAt).not.toBeNull();
+      expect(row!.output).toContain('create_alert action created alert successfully');
+    }
+  });
+
+  it('records failed per-device results (status + error) when an action fails on every device (#2023)', async () => {
+    const partner = await createPartner();
+    const org = await createOrganization({ partnerId: partner.id });
+    const deviceA = await seedDevice(org.id, 'fail-a');
+    const deviceB = await seedDevice(org.id, 'fail-b');
+
+    // A send_notification action pointing at a channel that does not exist:
+    // executeSendNotificationAction returns {success:false} deterministically
+    // (no throw), so every device fails without any external dependency.
+    const bogusChannelId = '00000000-0000-4000-8000-0000000000ff';
+    const [automation] = await withDbAccessContext(partnerContext(partner.id, []), () =>
+      db
+        .insert(automations)
+        .values({
+          name: 'Failing notification automation',
+          orgId: null,
+          partnerId: partner.id,
+          trigger: { type: 'manual' },
+          actions: [{ type: 'send_notification', notificationChannelId: bogusChannelId }],
+          onFailure: 'continue',
+          enabled: true,
+        })
+        .returning(),
+    );
+    createdAutomations.push(automation!.id);
+
+    const { run, targetDeviceIds } = await withDbAccessContext(SYSTEM_CTX, () =>
+      createAutomationRunRecord({ automation: automation!, triggeredBy: 'manual:test' }),
+    );
+
+    const result = await withDbAccessContext(SYSTEM_CTX, () =>
+      executeAutomationRun(run.id, targetDeviceIds),
+    );
+    expect(result.status).toBe('failed');
+    expect(result.devicesFailed).toBe(2);
+    expect(result.devicesSucceeded).toBe(0);
+
+    const deviceResultRows = await withDbAccessContext(SYSTEM_CTX, () =>
+      db
+        .select({
+          deviceId: automationRunDeviceResults.deviceId,
+          status: automationRunDeviceResults.status,
+          error: automationRunDeviceResults.error,
+          completedAt: automationRunDeviceResults.completedAt,
+        })
+        .from(automationRunDeviceResults)
+        .where(eq(automationRunDeviceResults.runId, run.id)),
+    );
+    expect(deviceResultRows).toHaveLength(2);
+    for (const deviceId of [deviceA, deviceB]) {
+      const row = deviceResultRows.find((r) => r.deviceId === deviceId);
+      expect(row).toBeDefined();
+      expect(row!.status).toBe('failed');
+      // First failing action's message is captured as the row error.
+      expect(row!.error).toContain('Notification channel not found');
+      expect(row!.completedAt).not.toBeNull();
+    }
   });
 });
 

@@ -91,6 +91,7 @@ export const DEVICE_DETACH_DEVICE_ID_TABLES = ['tickets'] as const;
 export const DEVICE_ORG_DENORMALIZED_TABLES = [
   'agent_logs', 'ai_screenshots', 'ai_sessions', 'alerts', 'asset_checkouts',
   'audit_baseline_results', 'audit_policy_states',
+  'automation_run_device_results',
   'backup_chains', 'backup_jobs', 'backup_sla_events',
   'backup_snapshots', 'backup_verifications',
   'brain_device_context', 'browser_extensions', 'browser_policy_violations',
@@ -189,6 +190,9 @@ export const DEVICE_CASCADE_DELETE_TABLES = [
   // Monitoring & logs
   'service_process_check_results', 'alerts', 'agent_logs', 'script_executions',
   'device_event_logs', 'automation_policy_compliance', 'backup_sla_events',
+  // Per-device automation execution results (FK device_id → devices.id ON DELETE
+  // CASCADE; leaf table, no children) — #2023
+  'automation_run_device_results',
   // Security
   'sensitive_data_scans', 'sensitive_data_findings',
   'dns_security_events', 'dns_event_aggregations',
