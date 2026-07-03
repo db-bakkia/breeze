@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, lt, sql } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import { db, withSystemDbAccessContext } from "../db";
 import { installerBootstrapTokens } from "../db/schema/installerBootstrapTokens";
@@ -37,7 +37,8 @@ function generateChildEnrollmentKey(): string {
 
 /**
  * Returns a short SHA-256 hash of a sensitive token for log correlation.
- * Never log raw bootstrap tokens — they grant single-use enrollment.
+ * Never log raw bootstrap tokens — they grant device enrollment up to the
+ * token's max_usage times, so a leaked token is worth that many enrollments.
  */
 function hashTokenForLog(token: string): string {
   return createHash("sha256").update(token).digest("hex").slice(0, 16);
@@ -59,18 +60,23 @@ export const installerRoutes = new Hono();
 /**
  * Public bootstrap endpoint. The token IS the auth — no JWT, no API key,
  * no session. Resolves the token to an enrollment payload, atomically
- * marks it consumed, and lazily creates a short-lived child enrollment key.
+ * records one redemption, and lazily creates a short-lived child enrollment
+ * key for the calling device.
  *
- * Invalid / expired / already-used tokens all return the same 404 to
+ * The token is redeemable up to max_usage times — once per device that
+ * installs the same downloaded installer — with a fresh single-use child key
+ * minted each time (#2161). A max_usage = 1 token is effectively single-use.
+ *
+ * Invalid / expired / exhausted tokens all return the same 404 to
  * avoid leaking which condition was hit.
  *
- * C1 (atomicity): We INSERT the child enrollment key BEFORE marking the
- * token consumed. If the atomic UPDATE returns empty (concurrent consume),
- * we DELETE the child key we just created and return 404. This reorder
- * approach avoids nested transactions (withSystemDbAccessContext already
- * wraps everything in a Postgres transaction for RLS context injection),
- * while ensuring the token is never permanently burned without a usable
- * child key.
+ * C1 (atomicity): We INSERT the child enrollment key BEFORE incrementing the
+ * token's consumed_count. If the atomic UPDATE returns empty (concurrent
+ * redemption exhausted the last slot), we DELETE the child key we just
+ * created and return 404. This reorder approach avoids nested transactions
+ * (withSystemDbAccessContext already wraps everything in a Postgres
+ * transaction for RLS context injection), while ensuring a redemption is
+ * never counted without a usable child key.
  */
 async function redeemBootstrapToken(c: Context, token: string) {
   if (!BOOTSTRAP_TOKEN_PATTERN.test(token)) {
@@ -96,9 +102,9 @@ async function redeemBootstrapToken(c: Context, token: string) {
       return null;
     }
 
-    if (row.consumedAt) {
+    if (row.consumedCount >= row.maxUsage) {
       console.error("[installer] bootstrap 404", {
-        reason: "already_consumed",
+        reason: "exhausted",
         tokenId: row.id,
         ip,
       });
@@ -152,7 +158,7 @@ async function redeemBootstrapToken(c: Context, token: string) {
       return null;
     }
 
-    // ── 3. INSERT child key BEFORE consuming the token (C1 reorder) ──
+    // ── 3. INSERT child key BEFORE recording the redemption (C1 reorder) ──
     // If the consume UPDATE loses a race, we'll DELETE this row below.
     const rawChildKey = generateChildEnrollmentKey();
     const childKeyHash = hashEnrollmentKey(rawChildKey);
@@ -165,45 +171,73 @@ async function redeemBootstrapToken(c: Context, token: string) {
         name: `${parent.name} (${platformLabel} ${hashTokenForLog(token)})`,
         key: childKeyHash,
         keySecretHash: parent.keySecretHash,
-        maxUsage: row.maxUsage,
+        // Each redemption hands this single key to exactly one device, so it is
+        // itself single-use. The token's max_usage governs how many devices may
+        // redeem (i.e. how many child keys get minted), NOT the fan-out of any
+        // one child key — see the consume guard below (#2161).
+        maxUsage: 1,
         expiresAt: childExpiresAt,
         createdBy: row.createdBy,
         installerPlatform: row.installerPlatform ?? "macos",
       })
       .returning();
 
-    // ── 4. Atomic single-use consume guard ────────────────────────────
-    // Two concurrent requests both read row.consumedAt = null, but only one
-    // UPDATE will return a row (Postgres serializes the write).
+    // ── 4. Atomic consume guard (increment up to max_usage) ────────────
+    // The WHERE consumed_count < max_usage serializes concurrent redemptions:
+    // Postgres applies the increments one at a time, so exactly max_usage of
+    // them see a row that still satisfies the predicate and RETURNING is
+    // non-empty. The (max_usage + 1)-th finds consumed_count === max_usage and
+    // gets nothing back. This is what makes one downloaded installer enroll up
+    // to N devices instead of just the first (#2161). consumed_at tracks the
+    // most recent redemption (informational only now).
     const [updated] = await db
       .update(installerBootstrapTokens)
       .set({
+        consumedCount: sql`${installerBootstrapTokens.consumedCount} + 1`,
         consumedAt: new Date(),
         consumedFromIp: ip === "unknown" ? null : ip,
       })
       .where(
         and(
           eq(installerBootstrapTokens.id, row.id),
-          isNull(installerBootstrapTokens.consumedAt),
+          lt(installerBootstrapTokens.consumedCount, installerBootstrapTokens.maxUsage),
         ),
       )
       .returning();
 
     if (!updated) {
-      // Lost the race — delete the child key we just created so we don't
-      // leave orphaned enrollment keys accumulating on repeated replays.
+      // Lost the race, or the token was exhausted between the read above and
+      // this write — delete the child key we just created so we don't leave
+      // orphaned enrollment keys accumulating on repeated replays.
       console.error("[installer] bootstrap 404", {
-        reason: "lost_race",
+        reason: "exhausted_on_consume",
         tokenId: row.id,
         ip,
       });
       if (childKey) {
+        // Safe to leave unchecked ONLY because this DELETE shares the redeem
+        // transaction with the INSERT above: a throw rolls both back (no
+        // orphan), and a 0-row delete is impossible (we just inserted the id).
+        // If the child INSERT is ever moved to its own transaction, this must
+        // become a checked/logged delete or it silently leaks enrollment keys.
         await db
           .delete(enrollmentKeys)
           .where(eq(enrollmentKeys.id, childKey.id));
       }
       return null;
     }
+
+    // Success audit: consumed_at/consumed_from_ip on the token row only retain
+    // the LAST redeemer, so record each redemption's IP + running count here —
+    // this is the only per-device forensic trail for a multi-use token.
+    console.log("[installer] bootstrap redeemed", {
+      reason: "redeemed",
+      tokenId: row.id,
+      consumedCount: updated.consumedCount,
+      maxUsage: row.maxUsage,
+      childKeyId: childKey?.id,
+      ip,
+    });
 
     // ── 5. Fetch org name for response ────────────────────────────────
     const [org] = await db
