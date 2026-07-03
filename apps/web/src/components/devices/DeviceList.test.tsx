@@ -67,6 +67,89 @@ describe('DeviceList — OS version display', () => {
   });
 });
 
+describe('DeviceList — Power column (#2142)', () => {
+  beforeEach(() => {
+    window.localStorage?.clear();
+  });
+
+  const enablePower = () => {
+    fireEvent.click(screen.getByRole('button', { name: /columns/i }));
+    fireEvent.click(screen.getByLabelText('Power'));
+  };
+
+  it('shows battery percentage for devices with a battery', () => {
+    const device: Device = {
+      ...baseDevice,
+      batteryStatus: { present: true, percent: 85, chargingState: 'discharging', pluggedIn: false, reportedAt: new Date().toISOString() },
+    };
+    render(<DeviceList devices={[device]} />);
+    enablePower();
+    expect(screen.getByTestId(`device-${device.id}-power`)).toHaveTextContent('85%');
+  });
+
+  it('renders a dash for a no-battery desktop', () => {
+    const device: Device = {
+      ...baseDevice,
+      batteryStatus: { present: false, pluggedIn: true, reportedAt: new Date().toISOString() },
+    };
+    render(<DeviceList devices={[device]} />);
+    enablePower();
+    const cell = screen.getByTestId(`device-${device.id}-power`);
+    expect(cell).toHaveTextContent('—');
+    expect(cell).not.toHaveTextContent('%');
+  });
+
+  it('renders a dash when no battery data has been reported', () => {
+    render(<DeviceList devices={[baseDevice]} />);
+    enablePower();
+    expect(screen.getByTestId(`device-${baseDevice.id}-power`)).toHaveTextContent('—');
+  });
+
+  it('flags a low, discharging battery with a destructive style and a detail tooltip', () => {
+    const device: Device = {
+      ...baseDevice,
+      batteryStatus: { present: true, percent: 15, chargingState: 'discharging', pluggedIn: false, timeRemainingMinutes: 42, reportedAt: new Date().toISOString() },
+    };
+    render(<DeviceList devices={[device]} />);
+    enablePower();
+    const cell = screen.getByTestId(`device-${device.id}-power`);
+    expect(cell).toHaveTextContent('15%');
+    // Low state is styled destructive.
+    expect(cell.querySelector('.text-destructive')).not.toBeNull();
+    // Tooltip carries the human-readable detail.
+    const title = cell.getAttribute('title') ?? '';
+    expect(title).toContain('On battery');
+    expect(title).toContain('remaining');
+  });
+
+  it('does NOT flag a charging battery as low even at a low charge', () => {
+    const device: Device = {
+      ...baseDevice,
+      batteryStatus: { present: true, percent: 15, chargingState: 'charging', pluggedIn: true, timeToFullMinutes: 90, reportedAt: new Date().toISOString() },
+    };
+    render(<DeviceList devices={[device]} />);
+    enablePower();
+    const cell = screen.getByTestId(`device-${device.id}-power`);
+    expect(cell).toHaveTextContent('15%');
+    // Charging → not a low-battery alert; success accent instead of destructive.
+    expect(cell.querySelector('.text-destructive')).toBeNull();
+    expect(cell.querySelector('.text-success')).not.toBeNull();
+    expect(cell.getAttribute('title') ?? '').toContain('Charging');
+  });
+
+  it('falls back to the charging-state label when percent is unavailable', () => {
+    const device: Device = {
+      ...baseDevice,
+      batteryStatus: { present: true, chargingState: 'charging', pluggedIn: true, reportedAt: new Date().toISOString() },
+    };
+    render(<DeviceList devices={[device]} />);
+    enablePower();
+    const cell = screen.getByTestId(`device-${device.id}-power`);
+    expect(cell).toHaveTextContent('Charging');
+    expect(cell).not.toHaveTextContent('%');
+  });
+});
+
 describe('DeviceList — Device column display names', () => {
   beforeEach(() => {
     window.localStorage?.clear();
