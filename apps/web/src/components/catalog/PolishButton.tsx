@@ -1,4 +1,5 @@
 import { useId, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { runAction, ActionError } from '../../lib/runAction';
 import { showToast } from '../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
@@ -98,7 +99,15 @@ export default function PolishButton({
         parseSuccess: (data) => (data as { data: PolishResult }).data,
         onUnauthorized: UNAUTHORIZED,
       });
-      if (!result.changed) {
+      // Server-side `changed` plus a client-side visual check: if what the user
+      // would SEE in the preview is identical after whitespace normalization
+      // (e.g. the only difference is a trailing newline), a before/after dialog
+      // of two identical blocks is worse than useless — toast instead.
+      const trimEq = (a: string | null | undefined, b: string | null | undefined) =>
+        (a ?? '').trim() === (b ?? '').trim();
+      const nameVisiblySame = result.name === null || trimEq(result.name, name);
+      const descVisiblySame = result.description === null || trimEq(result.description, description);
+      if (!result.changed || (nameVisiblySame && descVisiblySame)) {
         showToast({ message: 'Already looks good — no changes suggested.', type: 'success' });
         return;
       }
@@ -131,14 +140,16 @@ export default function PolishButton({
         type="button"
         onClick={() => void run()}
         disabled={disabled || busy}
+        aria-busy={busy}
         data-testid={`polish-btn-${idSuffix}`}
         title="Clean up the wording with AI — your numbers and specs stay; review the preview before applying"
         className={
           compact
-            ? 'inline-flex h-8 items-center rounded-md border px-2 text-xs font-medium hover:bg-muted disabled:opacity-50'
-            : 'inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50'
+            ? 'inline-flex h-8 items-center gap-1 rounded-md border px-2 text-xs font-medium hover:bg-muted disabled:opacity-50'
+            : 'inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50'
         }
       >
+        {busy && <Loader2 className={`animate-spin ${compact ? 'h-3 w-3' : 'h-3.5 w-3.5'}`} aria-hidden="true" />}
         {busy ? 'Polishing…' : (label ?? '✨ Polish with AI')}
       </button>
 

@@ -65,11 +65,15 @@ export const updateQuoteLineSchema = z.object({
   unitCost: money.nullable().optional(),
   sku: z.string().max(100).nullable().optional(),
   partNumber: z.string().max(100).nullable().optional(),
+  // Attach/replace (guid) or clear (null) the line's product image. Must be a
+  // quote_images row on the same quote — the service enforces ownership.
+  imageId: z.string().guid().nullable().optional(),
 });
 
 export const createQuoteSchema = z.object({
   orgId: z.string().guid(),
   siteId: z.string().guid().optional(),
+  title: z.string().max(200).optional(),
   currencyCode: z.string().length(3).default('USD'),
   expiryDate: isoDate.optional(),
   introNotes: z.string().max(5000).optional(),
@@ -79,6 +83,7 @@ export const createQuoteSchema = z.object({
 
 export const updateQuoteSchema = z.object({
   siteId: z.string().guid().nullable().optional(),
+  title: z.string().max(200).nullable().optional(),
   expiryDate: isoDate.nullable().optional(),
   introNotes: z.string().max(5000).nullable().optional(),
   terms: z.string().max(20_000).nullable().optional(),
@@ -100,6 +105,12 @@ export const reorderBlocksSchema = z.object({ blockIds: uniqueReorderIds });
 export const reorderLinesSchema = z.object({ lineIds: uniqueReorderIds });
 export type ReorderLinesInput = z.infer<typeof reorderLinesSchema>;
 export type ReorderBlocksInput = z.infer<typeof reorderBlocksSchema>;
+
+// Move a line to a different pricing-table (line_items) block on the same
+// quote. The service appends it to the end of the target block's sort order;
+// bundle children follow their parent.
+export const moveQuoteLineSchema = z.object({ blockId: z.string().guid() });
+export type MoveQuoteLineInput = z.infer<typeof moveQuoteLineSchema>;
 
 export const acceptQuoteSchema = z.object({
   signerName: z.string().min(1).max(255),

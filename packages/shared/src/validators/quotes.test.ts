@@ -3,7 +3,7 @@ import {
   createQuoteSchema, quoteLineInputSchema, quoteBlockInputSchema, listQuotesQuerySchema,
   acceptQuoteSchema, declineQuoteSchema,
   updateQuoteSchema, reorderBlocksSchema, reorderLinesSchema,
-  updateQuoteLineSchema, catalogQuoteLineSchema,
+  updateQuoteLineSchema, catalogQuoteLineSchema, moveQuoteLineSchema,
 } from './quotes';
 
 describe('quote validators', () => {
@@ -27,6 +27,20 @@ describe('quote validators', () => {
     });
     expect(line.name).toBe('Onsite setup');
     expect(line.description ?? null).toBeNull();
+  });
+
+  it('line update accepts an imageId guid, an explicit null, and rejects a non-guid', () => {
+    expect(updateQuoteLineSchema.parse({ imageId: '33333333-3333-3333-3333-333333333333' }).imageId)
+      .toBe('33333333-3333-3333-3333-333333333333');
+    expect(updateQuoteLineSchema.parse({ imageId: null }).imageId).toBeNull();
+    expect(updateQuoteLineSchema.safeParse({ imageId: 'not-a-guid' }).success).toBe(false);
+  });
+
+  it('create/update accept a bounded title and reject an oversized one', () => {
+    expect(createQuoteSchema.parse({ orgId: '11111111-1111-1111-1111-111111111111', title: 'Office refresh' }).title)
+      .toBe('Office refresh');
+    expect(updateQuoteSchema.parse({ title: null }).title).toBeNull();
+    expect(createQuoteSchema.safeParse({ orgId: '11111111-1111-1111-1111-111111111111', title: 'x'.repeat(201) }).success).toBe(false);
   });
 
   it('rejects a line with neither a name nor a description', () => {
@@ -113,5 +127,27 @@ describe('quote line cost/sku/partNumber', () => {
   });
   it('catalog line accepts an optional partNumber override', () => {
     expect(catalogQuoteLineSchema.safeParse({ catalogItemId: '00000000-0000-0000-0000-000000000001', quantity: 1, partNumber: 'MPN-1' }).success).toBe(true);
+  });
+});
+
+describe('moveQuoteLineSchema', () => {
+  const BLOCK_ID = '33333333-3333-3333-3333-333333333333';
+
+  it('accepts a guid blockId', () => {
+    const r = moveQuoteLineSchema.safeParse({ blockId: BLOCK_ID });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.blockId).toBe(BLOCK_ID);
+  });
+
+  it('rejects a non-guid blockId', () => {
+    expect(moveQuoteLineSchema.safeParse({ blockId: 'not-a-guid' }).success).toBe(false);
+  });
+
+  it('rejects a missing blockId', () => {
+    expect(moveQuoteLineSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('rejects a null blockId (moving to "no panel" is not supported)', () => {
+    expect(moveQuoteLineSchema.safeParse({ blockId: null }).success).toBe(false);
   });
 });

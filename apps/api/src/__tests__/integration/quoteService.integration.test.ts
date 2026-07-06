@@ -41,6 +41,7 @@ import {
   updateQuote,
   deleteDraftQuote,
   toCustomerLines,
+  moveLineToBlock,
 } from '../../services/quoteService';
 import { createCatalogItem, getCatalogItem, type CatalogActor } from '../../services/catalogService';
 import { type QuoteActor } from '../../services/quoteTypes';
@@ -612,5 +613,171 @@ describe('quoteService (breeze_app, real DB)', () => {
     // sku and partNumber are acceptable on the customer document.
     expect(stripped).toHaveProperty('sku', 'SKU-1');
     expect(stripped).toHaveProperty('partNumber', 'P-001');
+  });
+
+  // ---- moveLineToBlock ------------------------------------------------------
+
+  /** Seed a quote with two pricing blocks and three manual lines: A1, A2 in
+   *  blockA; B1 in blockB. Returns everything the move tests need. */
+  async function seedTwoPanelQuote(fx: Fixture) {
+    return withDbAccessContext(fx.ctxA, async () => {
+      const quote = await createQuote({ orgId: fx.orgA.id, currencyCode: 'USD' }, fx.actorA);
+      const blockA = await addBlock(quote.id, { blockType: 'line_items', content: {} }, fx.actorA);
+      const blockB = await addBlock(quote.id, { blockType: 'line_items', content: {} }, fx.actorA);
+      const mk = (name: string, blockId: string) =>
+        addManualLine(quote.id, {
+          sourceType: 'manual', name, description: null, quantity: 1, unitPrice: 10,
+          taxable: false, customerVisible: true, recurrence: 'one_time', blockId,
+        }, fx.actorA);
+      const lineA1 = await mk('A1', blockA.id);
+      const lineA2 = await mk('A2', blockA.id);
+      const lineB1 = await mk('B1', blockB.id);
+      return { quote, blockA, blockB, lineA1, lineA2, lineB1 };
+    });
+  }
+
+  runDb('moveLineToBlock appends the line to the end of the target block', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+
+    const moved = await withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, s.blockB.id, fx.actorA)
+    );
+    expect(moved.blockId).toBe(s.blockB.id);
+    expect(moved.sortOrder).toBeGreaterThan(s.lineB1.sortOrder);
+
+    const rows = await withDbAccessContext(fx.ctxA, () =>
+      db.select({ id: quoteLines.id, blockId: quoteLines.blockId, sortOrder: quoteLines.sortOrder })
+        .from(quoteLines).where(eq(quoteLines.quoteId, s.quote.id))
+    );
+    const inB = rows.filter((r) => r.blockId === s.blockB.id).sort((a, b) => a.sortOrder - b.sortOrder);
+    expect(inB.map((r) => r.id)).toEqual([s.lineB1.id, s.lineA1.id]);
+    const inA = rows.filter((r) => r.blockId === s.blockA.id);
+    expect(inA.map((r) => r.id)).toEqual([s.lineA2.id]);
+  });
+
+  runDb('moveLineToBlock is a no-op success when the line is already in the target block', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    const moved = await withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, s.blockA.id, fx.actorA)
+    );
+    expect(moved.blockId).toBe(s.blockA.id);
+    expect(moved.sortOrder).toBe(s.lineA1.sortOrder); // untouched
+  });
+
+  runDb('moveLineToBlock rejects a non-line_items target block', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    const heading = await withDbAccessContext(fx.ctxA, () =>
+      addBlock(s.quote.id, { blockType: 'heading', content: { text: 'Summary', level: 2 } }, fx.actorA)
+    );
+    await expect(withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, heading.id, fx.actorA)
+    )).rejects.toMatchObject({ code: 'BLOCK_NOT_LINE_ITEMS', status: 400 });
+  });
+
+  runDb('moveLineToBlock 404s when the target block belongs to another quote', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    const other = await withDbAccessContext(fx.ctxA, async () => {
+      const q2 = await createQuote({ orgId: fx.orgA.id, currencyCode: 'USD' }, fx.actorA);
+      return addBlock(q2.id, { blockType: 'line_items', content: {} }, fx.actorA);
+    });
+    await expect(withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, other.id, fx.actorA)
+    )).rejects.toMatchObject({ code: 'BLOCK_NOT_FOUND', status: 404 });
+  });
+
+  runDb('moveLineToBlock moves bundle children with their parent, in order', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    // Seed two bundle children under lineA1 directly (system scope bypasses RLS
+    // for the seed, matching the sibling seed helpers in this file).
+    const [c1, c2] = await withSystemDbAccessContext(async () => {
+      const mkChild = async (name: string, sortOrder: number) => {
+        const [row] = await db.insert(quoteLines).values({
+          quoteId: s.quote.id, orgId: fx.orgA.id, blockId: s.blockA.id,
+          sourceType: 'bundle', parentLineId: s.lineA1.id, name,
+          quantity: '1.00', unitPrice: '5.00', lineTotal: '5.00',
+          taxable: false, customerVisible: true, recurrence: 'one_time', sortOrder,
+        }).returning();
+        return row!;
+      };
+      return [await mkChild('child-1', 10), await mkChild('child-2', 11)];
+    });
+
+    await withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, s.blockB.id, fx.actorA)
+    );
+    const rows = await withDbAccessContext(fx.ctxA, () =>
+      db.select({ id: quoteLines.id, blockId: quoteLines.blockId, sortOrder: quoteLines.sortOrder })
+        .from(quoteLines).where(eq(quoteLines.quoteId, s.quote.id))
+    );
+    const inB = rows.filter((r) => r.blockId === s.blockB.id).sort((a, b) => a.sortOrder - b.sortOrder);
+    expect(inB.map((r) => r.id)).toEqual([s.lineB1.id, s.lineA1.id, c1.id, c2.id]);
+  });
+
+  runDb('moveLineToBlock rejects moving a bundle child directly', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    const child = await withSystemDbAccessContext(async () => {
+      const [row] = await db.insert(quoteLines).values({
+        quoteId: s.quote.id, orgId: fx.orgA.id, blockId: s.blockA.id,
+        sourceType: 'bundle', parentLineId: s.lineA1.id, name: 'child',
+        quantity: '1.00', unitPrice: '5.00', lineTotal: '5.00',
+        taxable: false, customerVisible: true, recurrence: 'one_time', sortOrder: 10,
+      }).returning();
+      return row!;
+    });
+    await expect(withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, child.id, s.blockB.id, fx.actorA)
+    )).rejects.toMatchObject({ code: 'LINE_IS_BUNDLE_CHILD', status: 400 });
+  });
+
+  runDb('moveLineToBlock refuses to reshape a non-draft quote (NOT_A_DRAFT)', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    // Flip to 'sent' under system scope (as the sibling draft-guard tests do) so a
+    // tech cannot silently reshape a quote a customer has already received.
+    await withSystemDbAccessContext(() =>
+      db.update(quotes).set({ status: 'sent' }).where(eq(quotes.id, s.quote.id))
+    );
+    await expect(withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, s.blockB.id, fx.actorA)
+    )).rejects.toMatchObject({ code: 'NOT_A_DRAFT', status: 409 });
+  });
+
+  runDb('moveLineToBlock 404s for a lineId that is not on this quote (LINE_NOT_FOUND)', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    // A line that lives on a DIFFERENT quote must not be movable into this one —
+    // the (lineId, quoteId) scoping is the tenant-safety check.
+    const foreignLine = await withDbAccessContext(fx.ctxA, async () => {
+      const q2 = await createQuote({ orgId: fx.orgA.id, currencyCode: 'USD' }, fx.actorA);
+      const b2 = await addBlock(q2.id, { blockType: 'line_items', content: {} }, fx.actorA);
+      return addManualLine(q2.id, {
+        sourceType: 'manual', name: 'foreign', description: null, quantity: 1, unitPrice: 10,
+        taxable: false, customerVisible: true, recurrence: 'one_time', blockId: b2.id,
+      }, fx.actorA);
+    });
+    await expect(withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, foreignLine.id, s.blockB.id, fx.actorA)
+    )).rejects.toMatchObject({ code: 'LINE_NOT_FOUND', status: 404 });
+  });
+
+  runDb('moveLineToBlock into an EMPTY target block starts sort order at 0', async () => {
+    const fx = await seedFixture();
+    const s = await seedTwoPanelQuote(fx);
+    // Exercises the COALESCE(MAX(sort_order), -1)+1 base-0 path — every other move
+    // test seeds the target with an existing line, so base is always >= 1.
+    const emptyBlock = await withDbAccessContext(fx.ctxA, () =>
+      addBlock(s.quote.id, { blockType: 'line_items', content: {} }, fx.actorA)
+    );
+    const moved = await withDbAccessContext(fx.ctxA, () =>
+      moveLineToBlock(s.quote.id, s.lineA1.id, emptyBlock.id, fx.actorA)
+    );
+    expect(moved.blockId).toBe(emptyBlock.id);
+    expect(moved.sortOrder).toBe(0);
   });
 });

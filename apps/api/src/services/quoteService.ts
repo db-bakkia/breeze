@@ -1,11 +1,12 @@
 import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { quotes, quoteLines, quoteBlocks } from '../db/schema/quotes';
+import { quotes, quoteLines, quoteBlocks, quoteImages } from '../db/schema/quotes';
 import { organizations, partners } from '../db/schema/orgs';
 import { catalogItems } from '../db/schema/catalog';
 import { computeLineTotal, resolveEffectiveTaxRate } from './invoiceMath';
 import { computeQuoteTotals, type QuoteLineForMath } from './quoteMath';
 import { QuoteServiceError, type QuoteActor } from './quoteTypes';
+import { allocateQuoteCounter, formatQuoteNumber } from './quoteNumbers';
 import type {
   CreateQuoteInput, UpdateQuoteInput, QuoteLineInput, QuoteBlockInput, ListQuotesQuery
 } from '@breeze/shared';
@@ -127,10 +128,19 @@ export async function createQuote(input: CreateQuoteInput, actor: QuoteActor) {
   const partnerId = resolvePartner(actor);
   assertOrg(actor, input.orgId);
   const taxRate = await resolveQuoteTaxRate(input.orgId, partnerId);
+  // Number at creation (not at send): techs reference the number while drafting
+  // and in the list. A deleted draft leaves a counter gap, which the numbering
+  // contract explicitly tolerates (see allocateQuoteCounter). sendQuote keeps
+  // this number and only allocates for legacy drafts that predate it.
+  const year = new Date().getUTCFullYear();
+  const counter = await allocateQuoteCounter(partnerId, year);
+  const quoteNumber = formatQuoteNumber('Q', year, counter);
   const [row] = await db.insert(quotes).values({
     partnerId,
     orgId: input.orgId,
     siteId: input.siteId ?? null,
+    quoteNumber,
+    title: input.title?.trim() || null,
     currencyCode: input.currencyCode,
     taxRate,
     expiryDate: input.expiryDate ?? null,
@@ -184,6 +194,7 @@ export async function updateQuote(id: string, input: UpdateQuoteInput, actor: Qu
   await loadDraft(id, actor);
   const set: Record<string, unknown> = { updatedAt: new Date() };
   if (input.siteId !== undefined) set.siteId = input.siteId;
+  if (input.title !== undefined) set.title = input.title === null ? null : input.title.trim() || null;
   if (input.expiryDate !== undefined) set.expiryDate = input.expiryDate;
   if (input.introNotes !== undefined) set.introNotes = input.introNotes;
   if (input.terms !== undefined) set.terms = input.terms;
@@ -363,6 +374,7 @@ export async function updateLine(
     recurrence?: 'one_time' | 'monthly' | 'annual';
     termMonths?: number | null; sortOrder?: number;
     unitCost?: number | null; sku?: string | null; partNumber?: string | null;
+    imageId?: string | null;
   },
   actor: QuoteActor
 ) {
@@ -389,6 +401,17 @@ export async function updateLine(
   if (input.unitCost !== undefined) set.unitCost = input.unitCost != null ? Number(input.unitCost).toFixed(2) : null;
   if (input.sku !== undefined) set.sku = input.sku;
   if (input.partNumber !== undefined) set.partNumber = input.partNumber;
+  if (input.imageId !== undefined) {
+    // Ownership check: the image must be a quote_images row on THIS quote, or a
+    // caller could point a line at another tenant's image and exfiltrate its
+    // bytes through the customer document/PDF.
+    if (input.imageId !== null) {
+      const [img] = await db.select({ id: quoteImages.id }).from(quoteImages)
+        .where(and(eq(quoteImages.id, input.imageId), eq(quoteImages.quoteId, quoteId))).limit(1);
+      if (!img) throw new QuoteServiceError('Image not found on this quote', 404, 'IMAGE_NOT_FOUND');
+    }
+    set.imageId = input.imageId;
+  }
   await db.update(quoteLines).set(set).where(eq(quoteLines.id, lineId));
   await recomputeAndPersist(quoteId);
   const [updated] = await db.select().from(quoteLines).where(eq(quoteLines.id, lineId)).limit(1);
@@ -441,4 +464,55 @@ export async function reorderLines(quoteId: string, blockId: string, lineIds: st
       await tx.update(quoteLines).set({ sortOrder: i }).where(and(eq(quoteLines.id, id), eq(quoteLines.quoteId, quoteId), eq(quoteLines.blockId, blockId)));
     }
   });
+}
+
+/**
+ * Move a line to a different line_items block on the SAME quote, appending it
+ * (and any bundle children, preserving their relative order) to the end of the
+ * target block's sort order. Bundle children can never be moved independently
+ * — they ride with their parent. Totals are untouched: a move changes no
+ * amounts, so there is no recomputeAndPersist here.
+ */
+export async function moveLineToBlock(
+  quoteId: string,
+  lineId: string,
+  targetBlockId: string,
+  actor: QuoteActor
+) {
+  await loadDraft(quoteId, actor);
+  const [line] = await db.select().from(quoteLines)
+    .where(and(eq(quoteLines.id, lineId), eq(quoteLines.quoteId, quoteId))).limit(1);
+  if (!line) throw new QuoteServiceError('Line not found', 404, 'LINE_NOT_FOUND');
+  if (line.parentLineId) {
+    throw new QuoteServiceError('Bundle child lines move with their parent', 400, 'LINE_IS_BUNDLE_CHILD');
+  }
+  const [block] = await db.select({ id: quoteBlocks.id, blockType: quoteBlocks.blockType })
+    .from(quoteBlocks)
+    .where(and(eq(quoteBlocks.id, targetBlockId), eq(quoteBlocks.quoteId, quoteId))).limit(1);
+  if (!block) throw new QuoteServiceError('Block not found', 404, 'BLOCK_NOT_FOUND');
+  if (block.blockType !== 'line_items') {
+    throw new QuoteServiceError('Target block is not a pricing table', 400, 'BLOCK_NOT_LINE_ITEMS');
+  }
+  if (line.blockId === targetBlockId) return line; // already there — no-op
+
+  const [maxRow] = await db
+    .select({ max: sql<number>`COALESCE(MAX(${quoteLines.sortOrder}), -1)` })
+    .from(quoteLines)
+    .where(and(eq(quoteLines.quoteId, quoteId), eq(quoteLines.blockId, targetBlockId)));
+  const base = Number(maxRow?.max ?? -1) + 1;
+
+  await db.transaction(async (tx) => {
+    await tx.update(quoteLines).set({ blockId: targetBlockId, sortOrder: base })
+      .where(and(eq(quoteLines.id, lineId), eq(quoteLines.quoteId, quoteId)));
+    const children = await tx.select({ id: quoteLines.id }).from(quoteLines)
+      .where(and(eq(quoteLines.quoteId, quoteId), eq(quoteLines.parentLineId, lineId)))
+      .orderBy(quoteLines.sortOrder);
+    for (const [i, child] of children.entries()) {
+      await tx.update(quoteLines).set({ blockId: targetBlockId, sortOrder: base + 1 + i })
+        .where(eq(quoteLines.id, child.id));
+    }
+  });
+
+  const [updated] = await db.select().from(quoteLines).where(eq(quoteLines.id, lineId)).limit(1);
+  return updated!;
 }

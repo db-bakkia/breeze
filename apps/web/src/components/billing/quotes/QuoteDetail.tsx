@@ -333,7 +333,7 @@ function LineTable({ lines, currency, label, testId, taxRate, showTax }: { lines
       <table className="w-full min-w-[30rem] text-sm" data-testid={testId}>
         <thead>
           <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-            <th className="px-3 py-2 font-medium">Description</th>
+            <th className="px-3 py-2 font-medium">Item</th>
             <th className="px-3 py-2 text-right font-medium">Qty</th>
             <th className="px-3 py-2 text-right font-medium">Unit price</th>
             <th className="px-3 py-2 font-medium">Recurrence</th>
@@ -353,7 +353,7 @@ function LineTable({ lines, currency, label, testId, taxRate, showTax }: { lines
                 <tr key={l.id} className="border-t" data-testid={`quote-detail-line-${l.id}`}>
                   <td className="px-3 py-2">
                     <div className="font-medium text-foreground">{lineTitle(l)}</div>
-                    {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
+                    {lineBlurb(l) && <div className="whitespace-pre-line text-xs text-muted-foreground">{lineBlurb(l)}</div>}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">{l.quantity}</td>
                   <td className="px-3 py-2 text-right tabular-nums">{formatMoney(l.unitPrice, currency)}</td>
