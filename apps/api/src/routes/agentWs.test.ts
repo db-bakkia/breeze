@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { and, eq, notInArray } from 'drizzle-orm';
 
 const updateRestoreJobFromResultMock = vi.fn().mockResolvedValue(true);
 
@@ -155,6 +156,7 @@ vi.mock('../services/tenantStatus', () => ({
 }));
 
 import { db } from '../db';
+import { devices } from '../db/schema';
 import {
   createAgentWsHandlers,
   createAgentWsRoutes,
@@ -172,6 +174,7 @@ import { processBackupVerificationResult } from './backup/verificationService';
 import { updateRestoreJobFromResult } from '../services/restoreResultPersistence';
 import { rateLimiter } from '../services/rate-limit';
 import { revokeViewerSession } from '../services/viewerTokenRevocation';
+import { publishEvent } from '../services/eventBus';
 
 function wsMock() {
   return {
@@ -318,6 +321,102 @@ describe('agent websocket handshake', () => {
     } as any, ws as any);
 
     expect(vi.mocked(handleTerminalOutput)).toHaveBeenCalledWith(sessionId, 'café\n');
+  });
+});
+
+// Regression coverage for #2230 — see the updateDeviceStatus() doc comment in
+// agentWs.ts for the full incident writeup. These tests pin the terminal-status
+// guard on every agent-driven status write: connect, WS heartbeat (the actual
+// resurrection vector), disconnect, and the update_status self-update message.
+describe('WS lifecycle status writes — terminal-status guard (#2230)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  const TERMINAL_GUARD = notInArray(devices.status, ['decommissioned', 'quarantined']);
+
+  function rigStatusUpdateCapture() {
+    const whereMock = vi.fn().mockResolvedValue([]);
+    const setMock = vi.fn().mockReturnValue({ where: whereMock });
+    vi.mocked(db.update).mockReturnValue({ set: setMock } as any);
+    return { whereMock, setMock };
+  }
+
+  it('excludes decommissioned/quarantined rows when flipping a device online on connect', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123' };
+    const { whereMock, setMock } = rigStatusUpdateCapture();
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([]) as any);
+
+    const handlers = createAgentWsHandlers('agent-123', preValidatedAgent);
+    await handlers.onOpen({}, wsMock() as any);
+
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'online' }));
+    expect(whereMock).toHaveBeenCalledWith(
+      and(eq(devices.agentId, 'agent-123'), TERMINAL_GUARD)
+    );
+  });
+
+  it('excludes decommissioned/quarantined rows when flipping a device offline on disconnect', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123' };
+
+    const handlers = createAgentWsHandlers('agent-123', preValidatedAgent);
+    const ws = wsMock();
+
+    // Connect first so onClose sees this ws as the active connection.
+    vi.mocked(db.update).mockReturnValue({ set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }) } as any);
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([]) as any);
+    await handlers.onOpen({}, ws as any);
+
+    vi.clearAllMocks();
+    vi.mocked(publishEvent).mockResolvedValue('event-id');
+    const { whereMock, setMock } = rigStatusUpdateCapture();
+    // onClose status pre-check select — return a live row so the offline write runs.
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([
+      { id: 'device-123', siteId: 'site-1', status: 'online', hostname: 'host-1' },
+    ]) as any);
+
+    await handlers.onClose({}, ws as any);
+
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'offline' }));
+    expect(whereMock).toHaveBeenCalledWith(
+      and(eq(devices.agentId, 'agent-123'), TERMINAL_GUARD)
+    );
+  });
+
+  it('excludes decommissioned/quarantined rows when a WS heartbeat flips a device online', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123' };
+    const { whereMock, setMock } = rigStatusUpdateCapture();
+    // getPendingCommands device lookup — no row, so no command claim follows.
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([]) as any);
+
+    const handlers = createAgentWsHandlers('agent-123', preValidatedAgent);
+    const ws = wsMock();
+
+    await handlers.onMessage({
+      data: JSON.stringify({ type: 'heartbeat', timestamp: 1234567890 }),
+    } as any, ws as any);
+
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'online' }));
+    expect(whereMock).toHaveBeenCalledWith(
+      and(eq(devices.agentId, 'agent-123'), TERMINAL_GUARD)
+    );
+    expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('"heartbeat_ack"'));
+  });
+
+  it('excludes decommissioned/quarantined rows when update_status flips a device to updating', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123' };
+    const { whereMock, setMock } = rigStatusUpdateCapture();
+
+    const handlers = createAgentWsHandlers('agent-123', preValidatedAgent);
+
+    await handlers.onMessage({
+      data: JSON.stringify({ type: 'update_status', targetVersion: '1.2.3' }),
+    } as any, wsMock() as any);
+
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'updating' }));
+    expect(whereMock).toHaveBeenCalledWith(
+      and(eq(devices.agentId, 'agent-123'), TERMINAL_GUARD)
+    );
   });
 });
 
