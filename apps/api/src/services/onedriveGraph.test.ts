@@ -9,7 +9,14 @@ vi.mock('./sentry', () => ({ captureException: vi.fn() }));
 
 import { getToken, graphFetch } from './m365DirectGraph';
 import { captureException } from './sentry';
-import { listSharePointLibraries, resolveUserGroupMembership, buildTenantAutoMountValue } from './onedriveGraph';
+import {
+  clearGroupMembershipCache,
+  GROUP_MEMBERSHIP_CACHE_TTL_MS,
+  listSharePointLibraries,
+  resolveUserGroupMembership,
+  resolveUserGroupMembershipCached,
+  buildTenantAutoMountValue,
+} from './onedriveGraph';
 
 describe('listSharePointLibraries', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -187,11 +194,109 @@ describe('resolveUserGroupMembership', () => {
     const calledPath = (graphFetch as any).mock.calls[0][2] as string;
     expect(calledPath).toContain('/users/');
     expect(calledPath).toContain('transitiveMemberOf');
+    // The OData group cast is an advanced query: Graph 400s without
+    // ConsistencyLevel: eventual + $count=true.
+    expect(calledPath).toContain('$count=true');
+    expect((graphFetch as any).mock.calls[0][4]).toEqual({ headers: { ConsistencyLevel: 'eventual' } });
+  });
+
+  it('a 2xx with no value array is an error, not an empty membership', async () => {
+    (graphFetch as any).mockResolvedValueOnce({ kind: 'ok', data: null });
+    const res = await resolveUserGroupMembership('org-1', 'u@contoso.com');
+    expect(res.kind).toBe('error');
+    expect((res as any).code).toBe('graph_malformed_response');
   });
 
   it('rejects an empty upn before calling Graph', async () => {
     const res = await resolveUserGroupMembership('org-1', '');
     expect(res.kind).toBe('error');
     expect((graphFetch as any)).not.toHaveBeenCalled();
+  });
+
+  it('follows @odata.nextLink and unions the pages', async () => {
+    (graphFetch as any)
+      .mockResolvedValueOnce({ kind: 'ok', data: {
+        value: [{ id: 'g-1' }],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/users/u/transitiveMemberOf?$skiptoken=abc',
+      } })
+      .mockResolvedValueOnce({ kind: 'ok', data: { value: [{ id: 'g-2' }] } });
+    const res = await resolveUserGroupMembership('org-1', 'u@contoso.com');
+    expect((res as any).data.groupIds).toEqual(['g-1', 'g-2']);
+    expect(graphFetch).toHaveBeenCalledTimes(2);
+    // page 2 must be requested via the absolute nextLink verbatim
+    expect((graphFetch as any).mock.calls[1][2]).toContain('$skiptoken=abc');
+  });
+
+  it('never returns a truncated set as ok — past the page bound it errors', async () => {
+    (graphFetch as any).mockResolvedValue({ kind: 'ok', data: {
+      value: [{ id: 'g-n' }],
+      '@odata.nextLink': 'https://graph.microsoft.com/v1.0/users/u/transitiveMemberOf?$skiptoken=more',
+    } });
+    const res = await resolveUserGroupMembership('org-1', 'u@contoso.com');
+    expect(res.kind).toBe('error');
+    expect((res as any).code).toBe('too_many_groups');
+    expect(graphFetch).toHaveBeenCalledTimes(5); // GROUP_MEMBERSHIP_MAX_PAGES
+  });
+
+  it('a mid-pagination Graph error propagates (not a partial ok)', async () => {
+    (graphFetch as any)
+      .mockResolvedValueOnce({ kind: 'ok', data: {
+        value: [{ id: 'g-1' }],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/next',
+      } })
+      .mockResolvedValueOnce({ kind: 'error', code: 'graph_unreachable', message: 'x' });
+    const res = await resolveUserGroupMembership('org-1', 'u@contoso.com');
+    expect(res.kind).toBe('error');
+    expect((res as any).code).toBe('graph_unreachable');
+  });
+});
+
+describe('resolveUserGroupMembershipCached', () => {
+  beforeEach(() => { vi.clearAllMocks(); clearGroupMembershipCache(); });
+
+  it('second call within TTL hits the cache (no second Graph call)', async () => {
+    (graphFetch as any).mockResolvedValueOnce({ kind: 'ok', data: { value: [{ id: 'g-1' }] } });
+    const a = await resolveUserGroupMembershipCached('org-1', 'User@Contoso.com');
+    const b = await resolveUserGroupMembershipCached('org-1', 'user@contoso.com'); // case-insensitive key
+    expect((a as any).data.groupIds).toEqual(['g-1']);
+    expect(b).toEqual(a);
+    expect(graphFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('errors are not cached (next call retries)', async () => {
+    (graphFetch as any)
+      .mockResolvedValueOnce({ kind: 'error', code: 'throttled', message: 'x' })
+      .mockResolvedValueOnce({ kind: 'ok', data: { value: [{ id: 'g-2' }] } });
+    const a = await resolveUserGroupMembershipCached('org-1', 'u@contoso.com');
+    expect(a.kind).toBe('error');
+    const b = await resolveUserGroupMembershipCached('org-1', 'u@contoso.com');
+    expect((b as any).data.groupIds).toEqual(['g-2']);
+    expect(graphFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('expired entries refetch — a revoked membership cannot outlive the TTL', async () => {
+    vi.useFakeTimers();
+    try {
+      (graphFetch as any)
+        .mockResolvedValueOnce({ kind: 'ok', data: { value: [{ id: 'g-1' }] } })
+        .mockResolvedValueOnce({ kind: 'ok', data: { value: [] } }); // user removed from the group
+      await resolveUserGroupMembershipCached('org-1', 'u@contoso.com');
+      vi.advanceTimersByTime(GROUP_MEMBERSHIP_CACHE_TTL_MS + 1);
+      const b = await resolveUserGroupMembershipCached('org-1', 'u@contoso.com');
+      expect((b as any).data.groupIds).toEqual([]);
+      expect(graphFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('distinct orgs do not share cache entries', async () => {
+    (graphFetch as any)
+      .mockResolvedValueOnce({ kind: 'ok', data: { value: [{ id: 'g-1' }] } })
+      .mockResolvedValueOnce({ kind: 'ok', data: { value: [{ id: 'g-9' }] } });
+    await resolveUserGroupMembershipCached('org-1', 'u@contoso.com');
+    const b = await resolveUserGroupMembershipCached('org-2', 'u@contoso.com');
+    expect((b as any).data.groupIds).toEqual(['g-9']);
+    expect(graphFetch).toHaveBeenCalledTimes(2);
   });
 });

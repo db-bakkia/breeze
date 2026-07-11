@@ -3,6 +3,7 @@
 package onedrivehelper
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -11,8 +12,11 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/breeze-rmm/agent/internal/logging"
 	"github.com/breeze-rmm/agent/internal/sessionbroker"
 )
+
+var log = logging.L("onedrivehelper")
 
 const (
 	policyKeyPath    = `SOFTWARE\Policies\Microsoft\OneDrive`
@@ -33,6 +37,7 @@ type userSession struct {
 // stop being enforced but are not scrubbed (unmount/revert is Sub-project B).
 func Apply(cfg Config) (*DeviceState, error) {
 	baseChanged, baseErr := applyBaseConfig(cfg)
+	errs := []error{baseErr}
 
 	sessions := activeUserSessions()
 	anyUserChanged := false
@@ -40,10 +45,15 @@ func Apply(cfg Config) (*DeviceState, error) {
 	var applied []LibraryRule
 	for _, s := range sessions {
 		isMember := func(groupName string) bool { return isTokenGroupMember(s, groupName) }
-		apply, _ := PartitionLibraries(cfg.Libraries, isMember)
+		upn := sessionUpn(s.sid)
+		apply, _ := PartitionLibraries(cfg.Libraries, isMember, upn)
 		changed, err := applyUserAutoMount(s.sid, apply)
 		if err != nil {
-			// One broken user hive must not stop the others.
+			// One broken user hive must not stop the others — but a hive that
+			// can't be written means that user's libraries silently never
+			// mount, so the failure must still surface (the heartbeat caller
+			// logs Apply's returned error).
+			errs = append(errs, fmt.Errorf("session %s: %w", s.sid, err))
 			continue
 		}
 		if changed {
@@ -63,7 +73,7 @@ func Apply(cfg Config) (*DeviceState, error) {
 	if (baseChanged || anyUserChanged) && cfg.Base.RestartOnChange {
 		restartOneDrive(sessions)
 	}
-	return state, baseErr
+	return state, errors.Join(errs...)
 }
 
 func containsString(xs []string, x string) bool {
@@ -246,6 +256,23 @@ func isTokenGroupMember(s userSession, groupName string) bool {
 	return s.groupSIDs[strings.ToUpper(sid.String())]
 }
 
+// sessionUpn reads the signed-in user's UPN from the session's own OneDrive
+// account key. Empty when the user isn't signed in to OneDrive Business or the
+// value is unreadable — callers treat empty as "cannot match graph_group rules"
+// (fail closed).
+func sessionUpn(sid string) string {
+	k, err := registry.OpenKey(registry.USERS, sid+`\`+accountKeySuffix, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue("UserEmail")
+	if err != nil {
+		return ""
+	}
+	return v
+}
+
 // restartOneDrive best-effort kills + relaunches OneDrive in each session so
 // policy/AutoMount changes take effect promptly. Confirmed-path-first: for
 // each session we resolve a launchable, absolute OneDrive.exe path (machine
@@ -319,7 +346,8 @@ var shellFolderValues = map[string]string{
 
 // readDeviceState reads OneDrive state across the active sessions. Flattening
 // rule (device-level row, per-user reality): signedIn/version/KFM come from the
-// first signed-in session; mounted libraries are the union of all sessions.
+// first signed-in session; mounted libraries and signedInUpns are the union of
+// all sessions (UPNs deduped case-insensitively, capped at 16).
 func readDeviceState(sessions []userSession, entitled []string, applied []LibraryRule) *DeviceState {
 	if entitled == nil {
 		entitled = []string{}
@@ -329,6 +357,7 @@ func readDeviceState(sessions []userSession, entitled []string, applied []Librar
 		MountedLibraries:  []string{},
 		EntitledLibraries: entitled,
 		DriftEntries:      []DriftEntry{},
+		SignedInUpns:      []string{},
 	}
 
 	// FOD reflects the policy we enforce (HKLM read-back).
@@ -346,6 +375,18 @@ func readDeviceState(sessions []userSession, entitled []string, applied []Librar
 			continue // this user isn't signed in to OneDrive Business
 		}
 		state.SignedIn = true
+		// Cap at 16 entries and 320 chars per UPN to match the server-side zod
+		// schema (schemas.ts signedInUpns) — a violating value drops the whole
+		// UPN list server-side, so enforce the bounds here and make any
+		// truncation visible instead of silently losing sessions 17+.
+		if upn, _, e := acct.GetStringValue("UserEmail"); e == nil && upn != "" && len(upn) <= 320 && !containsFold(state.SignedInUpns, upn) {
+			if len(state.SignedInUpns) < 16 {
+				state.SignedInUpns = append(state.SignedInUpns, upn)
+			} else {
+				log.Warn("signed-in UPN cap reached; not reporting this session's UPN",
+					"cap", 16, "sessionID", s.sessionID)
+			}
+		}
 		if !primaryFound {
 			primaryFound = true
 			if v, _, e := acct.GetStringValue("OneDriveVersion"); e == nil {
