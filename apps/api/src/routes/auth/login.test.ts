@@ -4,10 +4,20 @@ vi.mock('../../db', () => ({
   db: {
     select: vi.fn(),
     update: vi.fn(),
+    transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
   },
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}));
+
+vi.mock('../../services/authLifecycle', () => ({
+  revokeRefreshFamilyById: vi.fn(async () => undefined),
+  // SR2-08: the account-locked reset link (recordAccountFailureAndMaybeNotify)
+  // advances password_reset_epoch the same way /forgot-password does. No
+  // current test drives the `newlyLocked` branch, but this keeps the mock
+  // shape consistent with what login.ts now imports.
+  advanceUserEpochs: vi.fn(async () => ({ authEpoch: 1, mfaEpoch: 1, emailEpoch: 1, passwordResetEpoch: 2 })),
 }));
 
 vi.mock('../../db/schema', () => ({
@@ -18,6 +28,8 @@ vi.mock('../../db/schema', () => ({
     status: 'users.status',
     passwordChangedAt: 'users.passwordChangedAt',
     lastLoginAt: 'users.lastLoginAt',
+    authEpoch: 'users.authEpoch',
+    mfaEpoch: 'users.mfaEpoch',
   },
 }));
 
@@ -51,6 +63,8 @@ vi.mock('../../services', () => ({
   clearAccountFailures: vi.fn(async () => undefined),
   isAccountLocked: vi.fn(async () => false),
   getAccountLockoutWindowSeconds: vi.fn(() => 900),
+  getUserEpochs: vi.fn(async () => ({ authEpoch: 1, mfaEpoch: 1 })),
+  getRefreshFamily: vi.fn(async () => ({ revokedAt: null, absoluteExpiresAt: new Date(Date.now() + 86_400_000) })),
 }));
 
 vi.mock('../../services/email', () => ({
@@ -75,7 +89,16 @@ vi.mock('../../services/mobileDeviceBinding', () => ({
 }));
 
 vi.mock('../../middleware/auth', () => ({
-  authMiddleware: vi.fn((_c: unknown, next: () => unknown) => next()),
+  authMiddleware: vi.fn((c: any, next: () => unknown) => {
+    c.set('auth', {
+      scope: 'organization',
+      partnerId: null,
+      orgId: 'org-1',
+      user: { id: 'user-1', email: 'user@example.test', name: 'Sample User' },
+      token: { sid: 'family-1' },
+    });
+    return next();
+  }),
 }));
 
 // NOTE: auditUserLoginFailure is NOT a bare vi.fn() here. The real helper
@@ -149,11 +172,17 @@ import {
   isRefreshTokenJtiRevoked,
   revokeFamily,
   revokeRefreshTokenJti,
+  revokeAllUserTokens,
   bindRefreshJtiToFamily,
   isTokenIssuedBeforePasswordChange,
+  getUserEpochs,
+  getRefreshFamily,
 } from '../../services';
+import { revokeRefreshFamilyById } from '../../services/authLifecycle';
+import { authMiddleware } from '../../middleware/auth';
 import { enforceIpAllowlist } from '../../services/ipAllowlist';
 import { recordFailedLogin } from '../../services/anomalyMetrics';
+import { createAuditLogAsync } from '../../services/auditService';
 import { TenantInactiveError } from '../../services/tenantStatus';
 import {
   resolveCurrentUserTokenContext,
@@ -161,6 +190,7 @@ import {
   resolveRefreshToken,
   validateCookieCsrfRequest,
   clearRefreshTokenCookie,
+  revokeCurrentRefreshTokenJti,
 } from './helpers';
 
 function selectChain(rows: unknown[]) {
@@ -424,6 +454,46 @@ describe('POST /login — last_login_at write runs under system DB context (#137
   });
 });
 
+describe('POST /login — mints aep/mep/sid from the live user row', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.NODE_ENV = 'test';
+    process.env.E2E_MODE = 'true';
+    vi.mocked(enforceIpAllowlist).mockResolvedValue({ decision: 'allow' });
+    vi.mocked(db.select).mockReturnValue(selectChain([{
+      id: 'user-1',
+      email: 'admin@msp.com',
+      name: 'Admin User',
+      passwordHash: 'password-hash',
+      status: 'active',
+      mfaEnabled: false,
+      mfaSecret: null,
+      mfaMethod: null,
+      phoneNumber: null,
+      avatarUrl: null,
+    }]) as any);
+    vi.mocked(db.update).mockReturnValue(updateChain() as any);
+    vi.mocked(getUserEpochs).mockResolvedValue({ authEpoch: 4, mfaEpoch: 2 });
+  });
+
+  it('passes the live epochs and the family id to createTokenPair', async () => {
+    const res = await postLogin({ email: 'admin@msp.com', password: 'correct-horse' });
+    expect(res.status).toBe(200);
+    expect(getUserEpochs).toHaveBeenCalledWith('user-1');
+    expect(createTokenPair).toHaveBeenCalledWith(
+      expect.objectContaining({ aep: 4, mep: 2 }),
+      { refreshFam: 'family-id' }
+    );
+  });
+
+  it('fails closed with a generic 401 when the epoch read returns null', async () => {
+    vi.mocked(getUserEpochs).mockResolvedValue(null);
+    const res = await postLogin({ email: 'admin@msp.com', password: 'correct-horse' });
+    expect(res.status).toBe(401);
+    expect(createTokenPair).not.toHaveBeenCalled();
+  });
+});
+
 describe('POST /refresh — hard-reject fam-less legacy tokens (#917 L-1)', () => {
   async function postRefresh() {
     return loginRoutes.request('/refresh', {
@@ -496,5 +566,266 @@ describe('POST /refresh — hard-reject fam-less legacy tokens (#917 L-1)', () =
     expect(vi.mocked(createTokenPair).mock.calls[0]?.[1]).toEqual({ refreshFam: 'family-42' });
     expect(bindRefreshJtiToFamily).toHaveBeenCalledWith('refresh-jti', 'family-42');
     expect(revokeFamily).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /refresh — epoch and absolute-expiry gates', () => {
+  async function postRefresh() {
+    return loginRoutes.request('/refresh', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.NODE_ENV = 'test';
+    process.env.E2E_MODE = 'true';
+    vi.mocked(resolveRefreshToken).mockReturnValue('refresh-token');
+    vi.mocked(validateCookieCsrfRequest).mockReturnValue(null);
+    vi.mocked(db.select).mockReturnValue(selectChain([{
+      id: 'user-1',
+      email: 'admin@msp.com',
+      status: 'active',
+      authEpoch: 3,
+      mfaEpoch: 1,
+    }]) as any);
+    vi.mocked(isRefreshTokenJtiRevoked).mockResolvedValue(false);
+    vi.mocked(revokeRefreshTokenJti).mockResolvedValue(true);
+    vi.mocked(resolveCurrentUserTokenContext).mockResolvedValue({
+      roleId: 'role-1',
+      partnerId: 'partner-1',
+      orgId: null,
+      scope: 'partner',
+    } as any);
+    vi.mocked(getRefreshFamily).mockResolvedValue({
+      revokedAt: null,
+      absoluteExpiresAt: new Date(Date.now() + 86_400_000),
+    });
+    vi.mocked(verifyToken).mockResolvedValue({
+      sub: 'user-1',
+      email: 'admin@msp.com',
+      type: 'refresh',
+      jti: 'jti-current',
+      fam: 'family-42',
+      aep: 3,
+      mep: 1,
+    } as any);
+  });
+
+  it('mints a new pair carrying the live epochs when aep/mep match the user row', async () => {
+    const res = await postRefresh();
+
+    expect(res.status).toBe(200);
+    expect(createTokenPair).toHaveBeenCalledWith(
+      expect.objectContaining({ aep: 3, mep: 1 }),
+      { refreshFam: 'family-42' }
+    );
+  });
+
+  it('rejects with 401 and clears the cookie when the refresh aep no longer matches the live user row (global sign-out)', async () => {
+    vi.mocked(verifyToken).mockResolvedValue({
+      sub: 'user-1',
+      email: 'admin@msp.com',
+      type: 'refresh',
+      jti: 'jti-current',
+      fam: 'family-42',
+      aep: 1, // stale — live user row is authEpoch: 3
+      mep: 1,
+    } as any);
+
+    const res = await postRefresh();
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: 'Invalid refresh token' });
+    expect(clearRefreshTokenCookie).toHaveBeenCalled();
+    expect(recordFailedLogin).toHaveBeenCalledWith('refresh_epoch_mismatch');
+    // Must bail BEFORE the jti rotation-claim dance so a denied refresh never
+    // burns rotation state.
+    expect(revokeRefreshTokenJti).not.toHaveBeenCalled();
+    expect(createTokenPair).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 401 when the refresh mep no longer matches the live user row (global MFA reset)', async () => {
+    vi.mocked(verifyToken).mockResolvedValue({
+      sub: 'user-1',
+      email: 'admin@msp.com',
+      type: 'refresh',
+      jti: 'jti-current',
+      fam: 'family-42',
+      aep: 3,
+      mep: 0, // stale — live user row is mfaEpoch: 1
+    } as any);
+
+    const res = await postRefresh();
+
+    expect(res.status).toBe(401);
+    expect(recordFailedLogin).toHaveBeenCalledWith('refresh_epoch_mismatch');
+    expect(createTokenPair).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 401 when the durable family row is revoked, even if the Redis sentinel says otherwise', async () => {
+    vi.mocked(getRefreshFamily).mockResolvedValue({
+      revokedAt: new Date(),
+      absoluteExpiresAt: new Date(Date.now() + 86_400_000),
+    });
+
+    const res = await postRefresh();
+
+    expect(res.status).toBe(401);
+    expect(clearRefreshTokenCookie).toHaveBeenCalled();
+    expect(createTokenPair).not.toHaveBeenCalled();
+    expect(revokeRefreshTokenJti).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 401 once the family has passed its absolute (non-sliding) expiry', async () => {
+    vi.mocked(getRefreshFamily).mockResolvedValue({
+      revokedAt: null,
+      absoluteExpiresAt: new Date(Date.now() - 1000),
+    });
+
+    const res = await postRefresh();
+
+    expect(res.status).toBe(401);
+    expect(createTokenPair).not.toHaveBeenCalled();
+    expect(revokeRefreshTokenJti).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 401 when no durable family row exists', async () => {
+    vi.mocked(getRefreshFamily).mockResolvedValue(null);
+
+    const res = await postRefresh();
+
+    expect(res.status).toBe(401);
+    expect(createTokenPair).not.toHaveBeenCalled();
+  });
+});
+
+// Task 10 — truthful logout (SR2-04): a copied refresh token used to survive
+// up to 7 days if Redis was down, because logout only ever did Redis cleanup
+// inside a try/catch that swallowed errors and always returned {success:
+// true}. Logout must now durably revoke the caller's own refresh family in
+// the DB FIRST, then do the same Redis cleanup it always did, and only report
+// success when the durable revoke actually committed.
+describe('POST /logout', () => {
+  async function postLogout() {
+    return loginRoutes.request('/logout', { method: 'POST' });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(revokeRefreshFamilyById).mockResolvedValue(undefined);
+    vi.mocked(revokeAllUserTokens).mockResolvedValue(undefined);
+    vi.mocked(revokeCurrentRefreshTokenJti).mockResolvedValue(undefined);
+    vi.mocked(resolveRefreshToken).mockReturnValue(null);
+  });
+
+  it('durably revokes the sid family, runs Redis cleanup, clears the cookie, and returns 200', async () => {
+    const res = await postLogout();
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ success: true });
+
+    // Durable revoke happens inside db.transaction, keyed on the access
+    // token's sid (set to 'family-1' by the authMiddleware mock above) —
+    // NOT a bare fire-and-forget call outside a transaction.
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(revokeRefreshFamilyById).toHaveBeenCalledWith(expect.anything(), 'family-1', 'logout');
+
+    // Same Redis cleanup logout always did — scoped to this session, never
+    // runPostCommitCleanup's user-wide MCP OAuth grant sweep.
+    expect(revokeAllUserTokens).toHaveBeenCalledWith('user-1');
+    expect(revokeCurrentRefreshTokenJti).toHaveBeenCalledWith(expect.anything(), 'user-1');
+
+    // ORDER matters: the durable DB revoke must land BEFORE the best-effort
+    // Redis cleanup — reordering the blocks would reintroduce SR2-04 (Redis
+    // succeeds, DB revoke silently skipped/failed, token survives 7 days).
+    const durableOrder = vi.mocked(revokeRefreshFamilyById).mock.invocationCallOrder[0];
+    const txOrder = vi.mocked(db.transaction).mock.invocationCallOrder[0];
+    const redisOrder = vi.mocked(revokeAllUserTokens).mock.invocationCallOrder[0];
+    expect(durableOrder).toBeDefined();
+    expect(redisOrder).toBeDefined();
+    expect(txOrder).toBeLessThan(redisOrder!);
+    expect(durableOrder!).toBeLessThan(redisOrder!);
+
+    expect(clearRefreshTokenCookie).toHaveBeenCalled();
+    expect(createAuditLogAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'user.logout', result: 'success' }),
+    );
+  });
+
+  it('returns 500 with a failure audit when the durable revoke throws, but still clears the cookie', async () => {
+    vi.mocked(db.transaction).mockRejectedValueOnce(new Error('connection lost'));
+
+    const res = await postLogout();
+    const body = await res.json();
+
+    expect(res.status).toBe(500);
+    expect(body).not.toEqual({ success: true });
+
+    expect(clearRefreshTokenCookie).toHaveBeenCalled();
+    expect(createAuditLogAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'user.logout',
+        result: 'failure',
+        details: { reason: 'durable_revocation_failed', familyId: 'family-1' },
+      }),
+    );
+
+    // The failure audit must never carry raw token/session material — only
+    // the family id (an opaque UUID, not a bearer credential) and a reason.
+    const auditCall = vi.mocked(createAuditLogAsync).mock.calls[0]?.[0] as { details?: unknown };
+    expect(JSON.stringify(auditCall.details)).not.toMatch(/eyJ|Bearer|refresh_token/i);
+  });
+
+  it('still reports success and clears the cookie when Redis cleanup fails after the durable revoke already committed', async () => {
+    vi.mocked(revokeAllUserTokens).mockRejectedValueOnce(new Error('redis down'));
+
+    const res = await postLogout();
+    const body = await res.json();
+
+    // The durable revocation already committed — Redis is best-effort cleanup
+    // layered on top, so its failure must not flip the reported outcome.
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ success: true });
+    expect(revokeRefreshFamilyById).toHaveBeenCalledWith(expect.anything(), 'family-1', 'logout');
+    expect(clearRefreshTokenCookie).toHaveBeenCalled();
+    expect(createAuditLogAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'user.logout', result: 'success' }),
+    );
+  });
+
+  it('skips the durable revoke for a legacy sid-less token with no refresh cookie, but still runs Redis cleanup and succeeds', async () => {
+    // Legacy access token minted before the sid rollout + no refresh cookie:
+    // there is no family to resolve, so the durable block is skipped entirely
+    // (nothing to revoke ≠ a failure) while everything else behaves as before.
+    vi.mocked(authMiddleware).mockImplementationOnce(async (c: any, next: () => Promise<void>) => {
+      c.set('auth', {
+        scope: 'organization',
+        partnerId: null,
+        orgId: 'org-1',
+        user: { id: 'user-1', email: 'user@example.test', name: 'Sample User' },
+        token: {}, // no sid
+      });
+      await next();
+    });
+    vi.mocked(resolveRefreshToken).mockReturnValue(null);
+
+    const res = await postLogout();
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ success: true });
+
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(revokeRefreshFamilyById).not.toHaveBeenCalled();
+
+    expect(revokeAllUserTokens).toHaveBeenCalledWith('user-1');
+    expect(revokeCurrentRefreshTokenJti).toHaveBeenCalledWith(expect.anything(), 'user-1');
+    expect(clearRefreshTokenCookie).toHaveBeenCalled();
+    expect(createAuditLogAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'user.logout', result: 'success' }),
+    );
   });
 });

@@ -25,8 +25,11 @@ import {
   recordAccountFailure,
   clearAccountFailures,
   isAccountLocked,
-  getAccountLockoutWindowSeconds
+  getAccountLockoutWindowSeconds,
+  getUserEpochs,
+  getRefreshFamily
 } from '../../services';
+import { advanceUserEpochs, revokeRefreshFamilyById } from '../../services/authLifecycle';
 import { getEmailService } from '../../services/email';
 import { createHash } from 'crypto';
 import { authMiddleware } from '../../middleware/auth';
@@ -148,11 +151,25 @@ async function recordAccountFailureAndMaybeNotify(
     // user a path back in without waiting out the lockout window. Reuses
     // the same `reset:<hash>` Redis convention as /forgot-password. 1h TTL
     // matches that endpoint.
+    //
+    // SR2-08: same generation+email envelope as /forgot-password. Pre-auth
+    // path (no ambient DB context) — wrap the epoch advance in the system
+    // context, same reasoning as /forgot-password.
     const resetToken = nanoid(48);
     const tokenHash = createHash('sha256').update(resetToken).digest('hex');
     const redis = getRedis();
     if (redis) {
-      await redis.setex(`reset:${tokenHash}`, 3600, user.id);
+      const gen = await withSystemDbAccessContext(() =>
+        db.transaction(async (tx) => advanceUserEpochs(tx, user.id, { passwordReset: true }))
+      );
+      const envelope = {
+        userId: user.id,
+        passwordResetEpoch: gen.passwordResetEpoch,
+        // The lockout path only has the user's live email (not a
+        // request-supplied address) — this is always the current one.
+        email: user.email.toLowerCase(),
+      };
+      await redis.setex(`reset:${tokenHash}`, 3600, JSON.stringify(envelope));
     }
     const appBaseUrl = (process.env.DASHBOARD_URL || process.env.PUBLIC_APP_URL || 'http://localhost:4321').replace(/\/$/, '');
     const resetUrl = `${appBaseUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
@@ -488,6 +505,17 @@ loginRoutes.post('/login', cfAccessLoginMiddleware, zValidator('json', loginSche
   // truth so no future path can quietly opt out of reuse-detection.
   const familyId = await mintRefreshTokenFamily(user.id);
 
+  // Epochs are the DB-authoritative source for aep/mep — never trust caller
+  // input. A null read means the user row vanished between the earlier
+  // lookup and here (deleted mid-request); fail closed with the same
+  // generic 401 every other login failure returns rather than leak which
+  // stage failed.
+  const epochs = await getUserEpochs(user.id);
+  if (!epochs) {
+    await floorPromise;
+    return c.json(genericAuthError(), 401);
+  }
+
   const tokens = await createTokenPair({
     sub: user.id,
     email: user.email,
@@ -496,6 +524,8 @@ loginRoutes.post('/login', cfAccessLoginMiddleware, zValidator('json', loginSche
     partnerId,
     scope,
     mfa: mfaSatisfied,
+    aep: epochs.authEpoch,
+    mep: epochs.mfaEpoch,
     // SR-001: bind the token to the mobile install id when the client sends
     // it. Web/SSO clients don't send the header → mdid stays absent → no
     // behaviour change for them.
@@ -566,13 +596,47 @@ loginRoutes.post('/login', cfAccessLoginMiddleware, zValidator('json', loginSche
 // Logout
 loginRoutes.post('/logout', authMiddleware, async (c) => {
   const auth = c.get('auth');
+  // Resolve the family: access-token `sid` is authoritative; fall back to the
+  // refresh cookie's verified `fam` when present.
+  let familyId: string | null = auth.token.sid ?? null;
+  if (!familyId) {
+    const refreshToken = resolveRefreshToken(c);
+    if (refreshToken) {
+      const rp = await verifyToken(refreshToken);
+      familyId = rp?.type === 'refresh' ? (rp.fam ?? null) : null;
+    }
+  }
 
+  let durableOk = true;
+  if (familyId) {
+    try {
+      // Self-revocation: the request context's userId IS this user, so the
+      // user-id-scoped refresh_token_families RLS policy admits the write —
+      // the ambient db.transaction is fine here (unlike Task 9's admin paths).
+      await db.transaction(async (tx) => {
+        await revokeRefreshFamilyById(tx, familyId!, 'logout');
+      });
+    } catch (error) {
+      durableOk = false;
+      console.error('[auth] Durable logout revocation failed:', error);
+    }
+  }
+
+  // Post-commit best-effort Redis cleanup — same scope as today's logout
+  // (user-wide access-token cutoff + current refresh jti). Deliberately NOT
+  // runPostCommitCleanup: logout must not sweep the user's MCP OAuth grants.
   try {
     await revokeAllUserTokens(auth.user.id);
     await revokeCurrentRefreshTokenJti(c, auth.user.id);
   } catch (error) {
-    console.error('[auth] Failed to revoke tokens during logout — clearing cookie anyway:', error);
+    console.error('[auth] Logout Redis cleanup failed (durable revocation state above):', error);
   }
+
+  // Always clear the local cookie — even on durable failure the client should
+  // drop its credential; the durable revoke is retried by ops via the audit.
+  // Runs BEFORE the audit write so "cookie always cleared" holds even against
+  // a synchronous throw from the audit call.
+  clearRefreshTokenCookie(c);
 
   createAuditLogAsync({
     orgId: auth.orgId ?? undefined,
@@ -584,10 +648,13 @@ loginRoutes.post('/logout', authMiddleware, async (c) => {
     resourceName: auth.user.name,
     ipAddress: getClientIP(c),
     userAgent: c.req.header('user-agent'),
-    result: 'success'
+    result: durableOk ? 'success' : 'failure',
+    details: durableOk ? undefined : { reason: 'durable_revocation_failed', familyId },
   });
 
-  clearRefreshTokenCookie(c);
+  if (!durableOk) {
+    return c.json({ error: 'Logout could not be fully completed. Please try again.' }, 500);
+  }
   return c.json({ success: true });
 });
 
@@ -704,6 +771,17 @@ loginRoutes.post('/refresh', async (c) => {
     return c.json({ error: 'Invalid refresh token' }, 401);
   }
 
+  // Belt-and-braces: isFamilyRevoked above may be answered from its Redis
+  // sentinel, which can lag the durable Postgres row. getRefreshFamily reads
+  // the authoritative row directly — cheap here since /refresh already reads
+  // Postgres for the user lookup below — and also enforces the absolute
+  // (non-sliding) expiry on the family.
+  const familyRow = await getRefreshFamily(familyId);
+  if (!familyRow || familyRow.revokedAt !== null || familyRow.absoluteExpiresAt.getTime() <= Date.now()) {
+    clearRefreshTokenCookie(c);
+    return c.json({ error: 'Invalid refresh token' }, 401);
+  }
+
   if (await isTokenRevokedForUser(payload.sub, payload.iat)) {
     clearRefreshTokenCookie(c);
     return c.json({ error: 'Invalid refresh token' }, 401);
@@ -717,6 +795,8 @@ loginRoutes.post('/refresh', async (c) => {
         email: users.email,
         status: users.status,
         passwordChangedAt: users.passwordChangedAt,
+        authEpoch: users.authEpoch,
+        mfaEpoch: users.mfaEpoch,
       })
       .from(users)
       .where(eq(users.id, payload.sub))
@@ -729,6 +809,16 @@ loginRoutes.post('/refresh', async (c) => {
   }
 
   if (isTokenIssuedBeforePasswordChange(payload.iat, user.passwordChangedAt)) {
+    clearRefreshTokenCookie(c);
+    return c.json({ error: 'Invalid refresh token' }, 401);
+  }
+
+  // Epoch gate: a refresh token minted before an auth/mfa state change must not
+  // rotate into a fresh access token (deliberate global sign-out). Legacy tokens
+  // lack aep/mep entirely → undefined !== number → rejected. Placed BEFORE the
+  // jti rotation-claim dance below so a denied refresh never burns rotation state.
+  if (payload.aep !== user.authEpoch || payload.mep !== user.mfaEpoch) {
+    recordFailedLogin('refresh_epoch_mismatch');
     clearRefreshTokenCookie(c);
     return c.json({ error: 'Invalid refresh token' }, 401);
   }
@@ -784,6 +874,8 @@ loginRoutes.post('/refresh', async (c) => {
     partnerId: context.partnerId,
     scope: context.scope,
     mfa: ENABLE_2FA ? payload.mfa : false,
+    aep: user.authEpoch,
+    mep: user.mfaEpoch,
     // SR-001: preserve the device binding from the prior (signed) refresh
     // token. Deliberately NOT re-read from the header — a refresh must not be
     // able to drop the binding by omitting it.
