@@ -37,6 +37,9 @@ var (
 	ErrRunConflict     = errors.New("workspace index run conflict")
 	ErrBatchTooLarge   = errors.New("workspace index batch too large")
 	ErrAuthUnavailable = errors.New("workspace index request skipped while authentication is unavailable")
+	// ErrNoServerURL names a wiring bug — the ServerURL provider is unset or
+	// returned empty — so it can't masquerade as a transport failure.
+	ErrNoServerURL = errors.New("workspace index client has no server URL (ServerURL provider unset or empty)")
 )
 
 // HTTPError describes a non-successful server response. Body is capped at 64
@@ -55,7 +58,12 @@ func (e *HTTPError) Error() string {
 
 // ClientConfig supplies the workspace-index client dependencies.
 type ClientConfig struct {
-	ServerURL    string
+	// ServerURL returns the CURRENT server base URL. It is a provider
+	// (typically heartbeat.ServerURL), not a copied string, so backup-server-URL
+	// promotion after failover (#2323) is visible to every request. A copied
+	// cfg.ServerURL kept uploading to a dead primary for the process lifetime
+	// (#2423).
+	ServerURL    func() string
 	EndpointBase string
 	AuthToken    *secmem.SecureString
 	HTTPClient   *http.Client
@@ -64,7 +72,7 @@ type ClientConfig struct {
 
 // Client calls the server's agent workspace-index endpoints.
 type Client struct {
-	serverURL    string
+	serverURL    func() string
 	endpointBase string
 	authToken    *secmem.SecureString
 	httpClient   *http.Client
@@ -89,8 +97,17 @@ func NewClient(cfg ClientConfig) *Client {
 	clientCopy.Timeout = requestTimeout
 	clientCopy.CheckRedirect = refuseUntrustedRedirect
 
+	// A nil provider is a wiring bug. Keep the client constructible (callers
+	// don't handle an error here) but never let it degrade into a scheme-less
+	// relative URL that fails forever as a cryptic transport error — name the
+	// real cause in every request error instead.
+	serverURL := cfg.ServerURL
+	if serverURL == nil {
+		serverURL = func() string { return "" }
+	}
+
 	return &Client{
-		serverURL:    strings.TrimRight(cfg.ServerURL, "/"),
+		serverURL:    serverURL,
 		endpointBase: endpointBase,
 		authToken:    cfg.AuthToken,
 		httpClient:   &clientCopy,
@@ -244,7 +261,25 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, retry
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, c.serverURL+c.endpointBase+path, bytes.NewReader(body))
+		// Resolve the server URL per attempt: the provider reflects
+		// backup-server-URL promotion after failover (#2423).
+		//
+		// A promotion mid-crawl re-points an in-flight run's PostBatch/
+		// CompleteRun at the newly promoted server. That is deliberate: the
+		// alternative — pinning the run to a server we already know is dead —
+		// uploads nothing at all. If the promoted server does not share the
+		// primary's database it rejects the stale runID, the crawl fails, and
+		// the loop simply re-runs the source against the live server on the
+		// next cadence. Failing one crawl beats stranding every future one.
+		baseURL := strings.TrimRight(c.serverURL(), "/")
+		if baseURL == "" {
+			// Fail fast and by name. Building the request anyway yields a
+			// scheme-less relative URL whose transport error ("unsupported
+			// protocol scheme") sends the next reader hunting for a DNS/TLS
+			// problem that does not exist, and burns the batch retries doing it.
+			return nil, ErrNoServerURL
+		}
+		req, err := http.NewRequestWithContext(ctx, method, baseURL+c.endpointBase+path, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create workspace index request: %w", err)
 		}

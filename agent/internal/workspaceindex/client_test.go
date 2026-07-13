@@ -51,7 +51,7 @@ func newTestClient(t *testing.T, handler http.Handler) *Client {
 	t.Cleanup(token.Zero)
 
 	return NewClient(ClientConfig{
-		ServerURL:  serverURL,
+		ServerURL:  func() string { return serverURL },
 		AuthToken:  token,
 		HTTPClient: httpClient,
 	})
@@ -198,7 +198,7 @@ func TestRedirectToOtherHostIsRefused(t *testing.T) {
 	token := secmem.NewSecureString("redirect-secret")
 	defer token.Zero()
 	client := NewClient(ClientConfig{
-		ServerURL:  "http://origin.test",
+		ServerURL:  func() string { return "http://origin.test" },
 		AuthToken:  token,
 		HTTPClient: &http.Client{Transport: transport},
 	})
@@ -236,6 +236,99 @@ func TestCredentialRedactsStringAndJSONRepresentations(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.get(); strings.Contains(got, credential.Password) {
 				t.Fatalf("representation leaked password: %q", got)
+			}
+		})
+	}
+}
+
+// TestClientFollowsServerURLProviderAcrossFailover pins #2423:
+// ClientConfig.ServerURL is a URL provider (heartbeat.ServerURL in
+// production), so after backup-server-URL promotion (#2323) the SAME client
+// must send subsequent requests to the promoted URL. A copied cfg.ServerURL
+// string kept POSTing batch uploads to the dead primary for the process
+// lifetime.
+func TestClientFollowsServerURLProviderAcrossFailover(t *testing.T) {
+	var primaryHits, backupHits atomic.Int32
+	const configBody = `{"enabled":false,"pollIntervalSeconds":60,"limits":{"maxBatchBytes":0,"maxBatchEntries":0,"walkOpsPerSecond":0},"sources":[]}`
+	transport := hostRoutingTransport{handlers: map[string]http.Handler{
+		"primary.test": http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryHits.Add(1)
+			_, _ = io.WriteString(w, configBody)
+		}),
+		"backup.test": http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			backupHits.Add(1)
+			_, _ = io.WriteString(w, configBody)
+		}),
+	}}
+	token := secmem.NewSecureString("agent-secret")
+	defer token.Zero()
+
+	var serverURL atomic.Value
+	serverURL.Store("http://primary.test")
+	client := NewClient(ClientConfig{
+		ServerURL:  func() string { return serverURL.Load().(string) },
+		AuthToken:  token,
+		HTTPClient: &http.Client{Transport: transport},
+	})
+
+	if _, err := client.FetchConfig(context.Background()); err != nil {
+		t.Fatalf("FetchConfig via primary: %v", err)
+	}
+	// Simulate backup-server-URL promotion: the provider now returns the
+	// promoted URL and the same long-lived client must follow it.
+	serverURL.Store("http://backup.test")
+	if _, err := client.FetchConfig(context.Background()); err != nil {
+		t.Fatalf("FetchConfig via promoted backup: %v", err)
+	}
+	// Batch upload is the path that actually matters for #2423 (it carries the
+	// crawl payload) and is the one place the base URL is re-resolved per retry
+	// attempt, so assert it follows the promotion too.
+	if err := client.PostBatch(context.Background(), "run-1", "", []Entry{{RelPath: "a"}}); err != nil {
+		t.Fatalf("PostBatch via promoted backup: %v", err)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary received %d requests, want 1", got)
+	}
+	if got := backupHits.Load(); got != 2 {
+		t.Fatalf("promoted backup received %d requests, want 2 (config + batch) — client still pinned to the old primary (#2423)", got)
+	}
+}
+
+// TestClientFailsFastWithoutServerURL pins that a nil/empty ServerURL provider
+// (a wiring bug) surfaces as ErrNoServerURL immediately, rather than degrading
+// into a scheme-less relative request that fails forever as a cryptic
+// transport error and burns the batch retries.
+func TestClientFailsFastWithoutServerURL(t *testing.T) {
+	var hits atomic.Int32
+	token := secmem.NewSecureString("agent-secret")
+	defer token.Zero()
+	transport := handlerRoundTripper{handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})}
+
+	for _, tt := range []struct {
+		name     string
+		provider func() string
+	}{
+		{name: "nil provider", provider: nil},
+		{name: "provider returns empty", provider: func() string { return "" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := NewClient(ClientConfig{
+				ServerURL:  tt.provider,
+				AuthToken:  token,
+				HTTPClient: &http.Client{Transport: transport},
+			})
+			if _, err := client.FetchConfig(context.Background()); !errors.Is(err, ErrNoServerURL) {
+				t.Fatalf("FetchConfig error = %v, want ErrNoServerURL", err)
+			}
+			// PostBatch would otherwise burn its retries on the bad URL.
+			if err := client.PostBatch(context.Background(), "run-1", "", []Entry{{RelPath: "a"}}); !errors.Is(err, ErrNoServerURL) {
+				t.Fatalf("PostBatch error = %v, want ErrNoServerURL", err)
+			}
+			if got := hits.Load(); got != 0 {
+				t.Fatalf("transport received %d requests, want 0 (must fail before dispatch)", got)
 			}
 		})
 	}

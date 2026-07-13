@@ -740,7 +740,10 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		// zeroed token and spins auth-failure logs (same class as ETW PR #959).
 		unifiCtx, unifiCancel = context.WithCancel(context.Background())
 		unifiDone = unifi.StartCollectorLoop(unifiCtx, unifi.CollectorDeps{
-			APIBaseURL: cfg.ServerURL,
+			// URL provider, not a copied string: after backup-server-URL
+			// promotion (#2323) uploads must follow the promoted primary
+			// instead of POSTing to the dead one forever (#2423).
+			APIBaseURL: hb.ServerURL,
 			AgentID:    cfg.AgentID,
 			HTTP:       newUnifiAPIClient(secureToken, tlsCfg),
 			// Loop failures here are config-fetch / telemetry-upload errors —
@@ -757,7 +760,9 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		log.Debug("workspace indexing disabled by local configuration")
 	} else {
 		workspaceClient := workspaceindex.NewClient(workspaceindex.ClientConfig{
-			ServerURL:    cfg.ServerURL,
+			// URL provider, not a copied string — see the UniFi collector
+			// wiring above (#2423).
+			ServerURL:    hb.ServerURL,
 			EndpointBase: cfg.WorkspaceIndex.EndpointBase,
 			AuthToken:    secureToken,
 			HTTPClient:   newUnifiAPIClient(secureToken, tlsCfg),
@@ -765,9 +770,15 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		})
 		var workspaceIndexCtx context.Context
 		workspaceIndexCtx, workspaceIndexCancel = context.WithCancel(context.Background())
-		workspaceIndexDone = workspaceindex.StartLoop(workspaceIndexCtx, workspaceindex.Deps{
-			Client: workspaceClient,
-		})
+		workspaceIndexDeps := workspaceindex.Deps{Client: workspaceClient}
+		// Device-audit trace for server-driven indexing activation (#2425).
+		// Assign only a non-nil logger: a nil *audit.Logger stored in the
+		// AuditLogger interface is a TYPED nil, which passes `!= nil` and would
+		// make the loop's audit guard silently decorative.
+		if auditLog := hb.AuditLog(); auditLog != nil {
+			workspaceIndexDeps.Audit = auditLog
+		}
+		workspaceIndexDone = workspaceindex.StartLoop(workspaceIndexCtx, workspaceIndexDeps)
 	}
 
 	// PAM Track 3: subscribe to Microsoft-Windows-LUA ETW provider for

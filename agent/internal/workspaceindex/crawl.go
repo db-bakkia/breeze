@@ -51,6 +51,20 @@ func runCrawl(ctx context.Context, deps Deps, src SourceConfig, limits ConfigLim
 	if src.ActiveRun != nil && src.ActiveRun.RunID == run.RunID {
 		resumeCursor = src.ActiveRun.Cursor
 	}
+	// Announce a substituted walk rate. Clamping a crawl from "unlimited" to
+	// 200 ops/s is a large, user-visible slowdown; doing it mutely produces
+	// "crawls got slow after the upgrade" reports that are undiagnosable from
+	// shipped logs (#2425).
+	switch ops := limits.WalkOpsPerSecond; {
+	case ops == walkOpsUnlimited:
+		deps.Log.Info("workspace index walk throttling disabled by explicit server sentinel", "sourceId", src.ID)
+	case ops == 0:
+		deps.Log.Info("workspace index walkOpsPerSecond not set by server; using local default ceiling",
+			"sourceId", src.ID, "defaultOpsPerSecond", defaultWalkOpsPerSecond)
+	case ops < 0:
+		deps.Log.Warn("workspace index walkOpsPerSecond from server is invalid; using local default ceiling",
+			"sourceId", src.ID, "received", ops, "defaultOpsPerSecond", defaultWalkOpsPerSecond)
+	}
 	limiter := crawlRateLimiter(limits.WalkOpsPerSecond)
 	emit := func(entry Entry) error {
 		if err := uploader.Add(ctx, entry); err != nil {
@@ -138,9 +152,24 @@ func runCrawl(ctx context.Context, deps Deps, src SourceConfig, limits ConfigLim
 	return nil
 }
 
+const (
+	// defaultWalkOpsPerSecond caps filesystem walk operations when the server
+	// config omits walkOpsPerSecond (the Go zero value on a partially
+	// populated crawl-config response) or sends an invalid value. A missing
+	// field must never silently remove IO throttling on a local/SMB walk
+	// (#2425).
+	defaultWalkOpsPerSecond = 200
+	// walkOpsUnlimited is the explicit server sentinel that disables walk
+	// throttling entirely. Only this exact value runs unthrottled.
+	walkOpsUnlimited = -1
+)
+
 func crawlRateLimiter(opsPerSecond int) *rate.Limiter {
-	if opsPerSecond <= 0 {
+	if opsPerSecond == walkOpsUnlimited {
 		return nil
+	}
+	if opsPerSecond <= 0 {
+		opsPerSecond = defaultWalkOpsPerSecond
 	}
 	return rate.NewLimiter(rate.Limit(opsPerSecond), opsPerSecond)
 }
