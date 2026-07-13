@@ -39,6 +39,18 @@ const (
 	defaultBufferSize    = 500
 )
 
+// maxEntriesPerShipRequest mirrors the API log endpoint's per-request cap:
+// apps/api/src/routes/agents/logs.ts validates `logs: z.array(...).max(200)`
+// and 400s the entire request when exceeded — and 4xx responses are never
+// retried, so an oversized request loses every entry in it (#2397). The
+// shipper accumulates up to defaultMaxBatchSize (500) entries per flush, so
+// each flush is split into chunks of at most this many entries per HTTP
+// request. Go and TypeScript can't share a constant; this comment is the
+// sync mechanism — this value must stay <= the API-side cap (never raise it
+// in lockstep with a server bump: self-hosted API versions vary, so the
+// agent must conform to the oldest supported cap).
+const maxEntriesPerShipRequest = 200
+
 // LogEntry represents a single log entry to be shipped remotely.
 type LogEntry struct {
 	Timestamp    time.Time      `json:"timestamp"`
@@ -265,6 +277,15 @@ const (
 	shipRetryBackoff = 1 * time.Second
 )
 
+// shipBatch ships a flushed batch, splitting it into chunks of at most
+// maxEntriesPerShipRequest entries per HTTP request — the API rejects any
+// larger request wholesale (#2397). Each chunk succeeds or fails
+// independently: a non-auth 4xx on one chunk drops only that chunk's entries
+// and later chunks still ship. A terminal failure — network error or 429/5xx
+// after exhausting retries (server unreachable/unhealthy), or a 401 (token
+// dead for every chunk alike) — aborts the remaining chunks instead, since
+// each further chunk would burn another doomed request or retry cycle for
+// the same outcome, blocking the ship loop.
 func (s *Shipper) shipBatch(entries []LogEntry) {
 	if s.authMon != nil && s.authMon.ShouldSkip() {
 		// Auth-dead: don't drop entries on the ticker path — re-buffer
@@ -296,13 +317,33 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 		return
 	}
 
+	for start := 0; start < len(entries); start += maxEntriesPerShipRequest {
+		end := min(start+maxEntriesPerShipRequest, len(entries))
+		if !s.shipChunk(entries[start:end]) {
+			if remaining := len(entries) - end; remaining > 0 {
+				fmt.Fprintf(os.Stderr, "[log-shipper] dropping %d entries in remaining chunks after terminal failure\n", remaining)
+				s.droppedCount.Add(int64(remaining))
+			}
+			return
+		}
+	}
+}
+
+// shipChunk sends one HTTP request carrying at most maxEntriesPerShipRequest
+// entries, with per-chunk retry for network errors and 429/5xx responses.
+// It returns false on terminal failures that would doom every remaining
+// chunk alike — network error or retryable status after exhausting retries,
+// or a 401 (dead token) — so the caller can stop burning requests on the
+// rest of the batch. Chunk-local outcomes (success, or a non-retried
+// non-auth 4xx that drops only this chunk) return true.
+func (s *Shipper) shipChunk(entries []LogEntry) bool {
 	payload, err := json.Marshal(map[string]any{
 		"logs": entries,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[log-shipper] marshal error: %v\n", err)
 		s.droppedCount.Add(int64(len(entries)))
-		return
+		return true
 	}
 
 	// Compress payload with gzip
@@ -311,12 +352,12 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 	if _, err := gw.Write(payload); err != nil {
 		fmt.Fprintf(os.Stderr, "[log-shipper] gzip write error: %v\n", err)
 		s.droppedCount.Add(int64(len(entries)))
-		return
+		return true
 	}
 	if err := gw.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "[log-shipper] gzip close error: %v\n", err)
 		s.droppedCount.Add(int64(len(entries)))
-		return
+		return true
 	}
 	compressedBytes := compressed.Bytes()
 
@@ -343,7 +384,7 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 			cancel()
 			fmt.Fprintf(os.Stderr, "[log-shipper] request build error: %v\n", err)
 			s.droppedCount.Add(int64(len(entries)))
-			return
+			return true
 		}
 
 		req.Header.Set("Authorization", "Bearer "+s.authToken.Reveal())
@@ -360,7 +401,7 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 			}
 			fmt.Fprintf(os.Stderr, "[log-shipper] HTTP error (giving up after %d attempts): %v\n", shipRetryCount+1, err)
 			s.droppedCount.Add(int64(len(entries)))
-			return
+			return false
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
@@ -379,7 +420,7 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 			fmt.Fprintf(os.Stderr, "[log-shipper] server returned %d (giving up after %d attempts): %s\n",
 				resp.StatusCode, shipRetryCount+1, string(body))
 			s.droppedCount.Add(int64(len(entries)))
-			return
+			return false
 		}
 
 		if resp.StatusCode >= 500 {
@@ -395,21 +436,34 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 			fmt.Fprintf(os.Stderr, "[log-shipper] server returned %d (giving up after %d attempts): %s\n",
 				resp.StatusCode, shipRetryCount+1, string(body))
 			s.droppedCount.Add(int64(len(entries)))
-			return
+			return false
 		}
 
 		if resp.StatusCode >= 400 {
-			// Client error (4xx): do not retry
+			// Client error (4xx): do not retry this chunk.
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			resp.Body.Close()
 			cancel()
-			if resp.StatusCode == http.StatusUnauthorized && s.authMon != nil {
-				s.authMon.RecordAuthFailure()
-			}
 			fmt.Fprintf(os.Stderr, "[log-shipper] server returned %d for %d entries: %s\n",
 				resp.StatusCode, len(entries), string(body))
 			s.droppedCount.Add(int64(len(entries)))
-			return
+			if resp.StatusCode == http.StatusUnauthorized {
+				// Auth is request-independent: the token won't get healthier
+				// between chunks, so shipping the batch's remaining chunks
+				// would just burn one doomed request — and one extra
+				// RecordAuthFailure — per chunk, skewing the auth monitor's
+				// skip threshold (tuned for one failure per flush, the
+				// pre-chunking behavior). Terminal: record once, abort batch.
+				if s.authMon != nil {
+					s.authMon.RecordAuthFailure()
+				}
+				return false
+			}
+			// Other 4xxs are chunk-local — the rejection is about this
+			// request's contents (e.g. a validation failure) — so only this
+			// chunk's entries are dropped and the batch's remaining chunks
+			// still ship (#2397).
+			return true
 		}
 
 		// Success
@@ -419,8 +473,9 @@ func (s *Shipper) shipBatch(entries []LogEntry) {
 		if s.authMon != nil {
 			s.authMon.RecordSuccess()
 		}
-		return
+		return true
 	}
+	return true // unreachable: the loop always returns on its final attempt
 }
 
 // DroppedLogCount returns the current count of dropped log entries without
