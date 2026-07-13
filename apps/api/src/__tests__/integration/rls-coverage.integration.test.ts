@@ -355,6 +355,22 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // ticketing domain (ticket_categories / ticket_response_templates are
   // partner-axis-only).
   'ticket_forms',
+  // backup_profiles (spec 2026-07-13): a backup selection profile ("what to
+  // protect" for a device class) is org-scoped (org_id set, partner_id NULL)
+  // OR partner-wide (partner_id set, org_id NULL — define "Server" once for
+  // all orgs). Created dual-axis from day one in 2026-07-13-backup-profiles.
+  // Org auto-discovery asserts the org branch; this entry asserts the
+  // breeze_has_partner_access branch. CHECK backup_profiles_one_owner_chk
+  // enforces exactly one axis. Destinations (backup_configs) stay org-owned —
+  // credentials. Functional cross-partner forge proof:
+  // backupProfilesPartnerRls.integration.test.ts.
+  'backup_profiles',
+  // config_policy_backup_settings (spec 2026-07-13): mirrors its parent
+  // policy's ownership axis (org XOR partner, denormalized — no EXISTS join
+  // to the parent in RLS). Was org-only NOT NULL until backup became
+  // partner-linkable; converted in 2026-07-13-backup-profiles. CHECK
+  // config_policy_backup_settings_one_owner_chk enforces exactly one axis.
+  'config_policy_backup_settings',
 ]);
 
 // Tables that carry a `device_id` FK but no denormalized `org_id`. Their

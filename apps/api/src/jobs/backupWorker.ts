@@ -16,6 +16,7 @@ import {
   backupConfigs,
   devices,
   configurationPolicies,
+  organizations,
   configPolicyFeatureLinks,
   configPolicyBackupSettings,
   hypervVms,
@@ -144,22 +145,77 @@ async function processCheckSchedules(): Promise<{ enqueued: number }> {
     )
     .where(eq(configurationPolicies.status, 'active'));
 
-  if (orgRows.length === 0) return { enqueued: 0 };
+  // 1b. Partner-wide backup policies (org_id NULL) cover every org under
+  // their partner — enumerate those orgs too, or partner-linked backup
+  // silently never schedules (the classic partner fan-out no-op).
+  const partnerRows = await db
+    .selectDistinct({ partnerId: configurationPolicies.partnerId })
+    .from(configurationPolicies)
+    .innerJoin(
+      configPolicyFeatureLinks,
+      and(
+        eq(configPolicyFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyFeatureLinks.featureType, 'backup')
+      )
+    )
+    .where(and(eq(configurationPolicies.status, 'active'), isNull(configurationPolicies.orgId)));
+  const partnerIds = partnerRows
+    .map((row) => row.partnerId)
+    .filter((id): id is string => !!id);
+  const partnerOrgRows = partnerIds.length > 0
+    ? await db
+        .select({ orgId: organizations.id })
+        .from(organizations)
+        .where(inArray(organizations.partnerId, partnerIds))
+    : [];
+
+  const orgIds = new Set<string>();
+  for (const { orgId } of orgRows) {
+    if (orgId) orgIds.add(orgId);
+  }
+  for (const { orgId } of partnerOrgRows) {
+    orgIds.add(orgId);
+  }
+
+  if (orgIds.size === 0) return { enqueued: 0 };
 
   let enqueued = 0;
 
   // 2. For each org, resolve all backup-assigned devices via config policy hierarchy.
-  // Backup features are org-owned only (#1724 rejects backup on partner-wide
-  // policies), so org_id is always present here; skip defensively if NULL.
-  for (const { orgId } of orgRows) {
-    if (!orgId) continue;
+  for (const orgId of orgIds) {
     try {
       const entries = await resolveAllBackupAssignedDevices(orgId);
 
       for (const entry of entries) {
-        // configId (featurePolicyId → backupConfigs.id) is required for dispatch
+        // Broken profile link (deleted/RLS-hidden/empty/malformed selections):
+        // skip loudly. Falling through would dispatch the legacy settings row,
+        // which on a profile link carries no paths — a backup that protects
+        // nothing while reporting success.
+        //
+        // The resolver flags this in selectionError, but re-derive it here too:
+        // this is the last checkpoint before a backup runs, so it must not
+        // depend on an upstream flag being set. A link that names a profile and
+        // has no specs NEVER falls back to legacy dispatch.
+        const profileId = entry.settings?.backupProfileId ?? null;
+        const brokenProfileLink =
+          entry.selectionError ??
+          (profileId && !entry.selectionSpecs
+            ? `Backup profile ${profileId} could not be resolved into any data source`
+            : null);
+        if (brokenProfileLink) {
+          console.error(
+            `[BackupWorker] Device ${entry.deviceId} (org ${orgId}, link ${entry.featureLinkId}): ${brokenProfileLink} — no backup scheduled`
+          );
+          continue;
+        }
+
+        // Destination chain already resolved (explicit → legacy → org
+        // default). Nothing resolved = loud skip, never silent: a partner
+        // policy hit an org with no default destination.
         if (!entry.configId) {
-          console.warn(`[BackupWorker] Skipping device ${entry.deviceId}: feature link ${entry.featureLinkId} has no configId`);
+          console.error(
+            `[BackupWorker] Device ${entry.deviceId} (org ${orgId}, link ${entry.featureLinkId}) has no backup destination — set an org default destination or pin one on the policy`
+          );
           continue;
         }
 
@@ -173,25 +229,33 @@ async function processCheckSchedules(): Promise<{ enqueued: number }> {
         );
         if (!occurrenceKey) continue;
 
-        const result = await createScheduledBackupJobIfAbsent({
-          orgId,
-          configId: entry.configId,
-          featureLinkId: entry.featureLinkId,
-          deviceId: entry.deviceId,
-          occurrenceKey,
-          createdAt: now,
-          dedupeWindowMinutes: SCHEDULE_LOOKBACK_MINUTES,
-        });
-
-        if (result?.created) {
-          // 6. Enqueue dispatch
-          await enqueueBackupDispatch(
-            result.job.id,
-            result.job.configId,
+        // Profile fan-out: one job per enabled selection. Legacy custom links
+        // (no profile) create a single job with NULL mode, exactly as before.
+        const specs = entry.selectionSpecs ?? [undefined];
+        for (const spec of specs) {
+          const result = await createScheduledBackupJobIfAbsent({
             orgId,
-            entry.deviceId
-          );
-          enqueued++;
+            configId: entry.configId,
+            featureLinkId: entry.featureLinkId,
+            deviceId: entry.deviceId,
+            occurrenceKey,
+            createdAt: now,
+            dedupeWindowMinutes: SCHEDULE_LOOKBACK_MINUTES,
+            ...(spec
+              ? { backupMode: spec.backupMode, modeTargets: spec.targets }
+              : {}),
+          });
+
+          if (result?.created) {
+            // 6. Enqueue dispatch
+            await enqueueBackupDispatch(
+              result.job.id,
+              result.job.configId,
+              orgId,
+              entry.deviceId
+            );
+            enqueued++;
+          }
         }
       }
     } catch (err) {
@@ -399,9 +463,14 @@ async function processDispatchBackup(
     return { dispatched: false };
   }
 
-  // Resolve backup mode from config policy backup settings (if feature link exists)
+  // Resolve backup mode: fan-out jobs carry their own selection (profile
+  // model); legacy jobs fall back to the feature link's settings row.
   const [job] = await db
-    .select({ featureLinkId: backupJobs.featureLinkId })
+    .select({
+      featureLinkId: backupJobs.featureLinkId,
+      backupMode: backupJobs.backupMode,
+      modeTargets: backupJobs.modeTargets,
+    })
     .from(backupJobs)
     .where(eq(backupJobs.id, data.jobId))
     .limit(1);
@@ -409,7 +478,10 @@ async function processDispatchBackup(
   let backupMode = 'file';
   let modeTargets: Record<string, unknown> = {};
 
-  if (job?.featureLinkId) {
+  if (job?.backupMode) {
+    backupMode = job.backupMode;
+    modeTargets = (job.modeTargets as Record<string, unknown>) ?? {};
+  } else if (job?.featureLinkId) {
     const [settings] = await db
       .select({
         backupMode: configPolicyBackupSettings.backupMode,
@@ -743,3 +815,9 @@ export async function shutdownBackupWorker(): Promise<void> {
 
   console.log('[BackupWorker] Backup worker shut down');
 }
+
+// Exported for unit tests of the schedule fan-out (profile expansion + loud
+// skips). Internal helper, not part of the worker's public surface.
+export const __testOnly = {
+  processCheckSchedules,
+};

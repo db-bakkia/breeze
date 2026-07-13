@@ -197,6 +197,19 @@ jobsRoutes.post(
   let configId = resolved?.configId ?? null;
   let featureLinkId = resolved?.featureLinkId ?? null;
 
+  // Broken profile link — refuse loudly. Falling through to the legacy fallback
+  // below would run a single empty file job and report success, so the tech
+  // would believe the server was backed up.
+  if (resolved?.selectionError) {
+    console.error(
+      `[BackupJobs] Manual run for device ${deviceId} (link ${resolved.featureLinkId}): ${resolved.selectionError}`
+    );
+    return c.json(
+      { error: 'The backup profile linked to this device\'s policy has no usable data sources. Fix the profile before running a backup.' },
+      400
+    );
+  }
+
   if (resolved && !configId) {
     return c.json({ error: 'Backup policy assigned but no backup config linked. Update the configuration policy.' }, 400);
   }
@@ -215,54 +228,86 @@ jobsRoutes.post(
     return c.json({ error: 'No backup config available' }, 400);
   }
 
-  const result = await createManualBackupJobIfIdle({
-    orgId,
-    configId,
-    featureLinkId,
-    deviceId,
-  });
+  // Profile fan-out: one manual job per enabled selection (idle-checked per
+  // device+mode). Legacy custom links create a single NULL-mode job as before.
+  const specs = resolved?.selectionSpecs ?? [undefined];
+  const createdJobs: Array<NonNullable<Awaited<ReturnType<typeof createManualBackupJobIfIdle>>>['job']> = [];
 
-  if (!result) {
-    return c.json({ error: 'Failed to create backup job' }, 500);
+  // A job row that is created but never enqueued sits `pending` forever, and
+  // its device+mode idle check then blocks every future manual run of that
+  // mode. Whenever we bail out mid-fan-out, fail the rows we already created.
+  const failCreatedJobs = async (error: string): Promise<void> => {
+    for (const job of createdJobs) {
+      await markBackupJobDispatchFailed(job.id, error);
+    }
+  };
+
+  for (const spec of specs) {
+    const result = await createManualBackupJobIfIdle({
+      orgId,
+      configId,
+      featureLinkId,
+      deviceId,
+      ...(spec ? { backupMode: spec.backupMode, modeTargets: spec.targets } : {}),
+    });
+    if (!result) {
+      const error = 'Failed to create backup job';
+      await failCreatedJobs(error);
+      return c.json({ error }, 500);
+    }
+    if (result.created) {
+      createdJobs.push(result.job);
+    }
   }
 
-  if (!result.created) {
+  if (createdJobs.length === 0) {
     return c.json({ error: 'A backup job is already pending or running for this device' }, 409);
   }
 
-  const row = result.job;
-
-  // Enqueue BullMQ job to dispatch to agent
-  try {
-    const { enqueueBackupDispatch } = await import(
-      '../../jobs/backupWorker'
-    );
-    await enqueueBackupDispatch(row.id, row.configId, orgId, deviceId);
-  } catch (err) {
-    const error = err instanceof Error ? err.message : 'Failed to enqueue backup dispatch';
-    console.error('[BackupJobs] Failed to enqueue dispatch:', err);
-    recordBackupDispatchFailure('manual_backup', 'enqueue_failed');
-    await markBackupJobDispatchFailed(row.id, error);
-    writeRouteAudit(c, {
-      orgId,
-      action: 'backup.job.run',
-      resourceType: 'backup_job',
-      resourceId: row.id,
-      details: { deviceId, configId, featureLinkId, error },
-      result: 'failure',
-    });
-    return c.json({ error }, 502);
+  // Enqueue BullMQ dispatch for each created job
+  const { enqueueBackupDispatch } = await import(
+    '../../jobs/backupWorker'
+  );
+  for (const [index, row] of createdJobs.entries()) {
+    try {
+      await enqueueBackupDispatch(row.id, row.configId, orgId, deviceId);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : 'Failed to enqueue backup dispatch';
+      console.error('[BackupJobs] Failed to enqueue dispatch:', err);
+      recordBackupDispatchFailure('manual_backup', 'enqueue_failed');
+      // This job and every one after it in the fan-out never reached the queue.
+      for (const stranded of createdJobs.slice(index)) {
+        await markBackupJobDispatchFailed(stranded.id, error);
+      }
+      writeRouteAudit(c, {
+        orgId,
+        action: 'backup.job.run',
+        resourceType: 'backup_job',
+        resourceId: row.id,
+        details: { deviceId, configId, featureLinkId, error },
+        result: 'failure',
+      });
+      return c.json({ error }, 502);
+    }
   }
 
+  const row = createdJobs[0]!;
   writeRouteAudit(c, {
     orgId,
     action: 'backup.job.run',
     resourceType: 'backup_job',
     resourceId: row.id,
-    details: { deviceId, configId, featureLinkId },
+    details: { deviceId, configId, featureLinkId, jobCount: createdJobs.length },
   });
 
-  return c.json(toJobResponse(row), 201);
+  return c.json(
+    {
+      ...toJobResponse(row),
+      jobs: createdJobs.map((job) => toJobResponse(job)),
+      jobCount: createdJobs.length,
+    },
+    201
+  );
 });
 
 jobsRoutes.get('/jobs/run-all/preview', requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action), async (c) => {

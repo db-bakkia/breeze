@@ -254,12 +254,27 @@ export const configPolicySensitiveDataSettings = pgTable('config_policy_sensitiv
 export const configPolicyBackupSettings = pgTable('config_policy_backup_settings', {
   id: uuid('id').primaryKey().defaultRandom(),
   featureLinkId: uuid('feature_link_id').notNull().unique().references(() => configPolicyFeatureLinks.id, { onDelete: 'cascade' }),
-  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // Dual-axis mirror of the parent policy's ownership (org XOR partner) so
+  // RLS never needs an EXISTS join to the parent. Partner-wide policies
+  // write partner_id with org_id NULL (2026-07-13-backup-profiles.sql).
+  orgId: uuid('org_id').references(() => organizations.id),
+  partnerId: uuid('partner_id').references(() => partners.id),
   schedule: jsonb('schedule').notNull().default({}),
   retention: jsonb('retention').notNull().default({}),
   paths: jsonb('paths').notNull().default([]),
   backupMode: backupModeEnum('backup_mode').notNull().default('file'),
   targets: jsonb('targets').notNull().default({}),
+  // Backup-profiles model (2026-07-13-backup-profiles.sql). When
+  // backup_profile_id is set, the profile's selections replace
+  // backup_mode/paths/targets (which remain the legacy "custom selection"
+  // path). destination_config_id points at the backup_configs destination;
+  // NULL with a profile set means "resolve the device org's default
+  // destination at job time" (required for partner-wide policies). Real FKs
+  // live in the SQL migration — no drizzle .references() here because
+  // schema/backup.ts already imports from this module and a reference back
+  // would create an import cycle.
+  backupProfileId: uuid('backup_profile_id'),
+  destinationConfigId: uuid('destination_config_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

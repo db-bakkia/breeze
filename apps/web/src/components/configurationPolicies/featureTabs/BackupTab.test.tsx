@@ -90,6 +90,10 @@ describe('BackupTab', () => {
         });
       }
 
+      if (url === '/backup/profiles' && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+
       if (url === '/backup/configs/config-1/test' && method === 'POST') {
         return makeJsonResponse({
           id: 'config-1',
@@ -571,5 +575,153 @@ describe('BackupTab', () => {
 
     await screen.findByText('Primary S3');
     expect(screen.getByText('Backup Window')).toBeTruthy();
+  });
+
+  it('profile mode: save links the profile and sends schedule/retention/destination inline', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url === '/backup/configs' && method === 'GET') {
+        return makeJsonResponse({ data: [baseConfig] });
+      }
+      if (url === '/backup/profiles' && method === 'GET') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'prof-1',
+              name: 'Server',
+              partnerId: null,
+              selections: { file: { enabled: true, paths: ['C:\\Users'] } },
+              isActive: true,
+            },
+          ],
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={undefined}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    // Profiles exist and there's no link yet → profile mode is the default
+    const profileCard = await screen.findByRole('radio', { name: 'Server' });
+    fireEvent.click(profileCard);
+    fireEvent.click(screen.getByRole('radio', { name: 'Primary S3' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(saveMock).toHaveBeenCalled());
+    const [linkId, payload] = saveMock.mock.calls[0]!;
+    expect(linkId).toBeNull();
+    expect(payload.featurePolicyId).toBe('prof-1');
+    expect(payload.inlineSettings.destinationConfigId).toBe('config-1');
+    expect(payload.inlineSettings.schedule).toBeTruthy();
+    expect(payload.inlineSettings.retention).toBeTruthy();
+    // "What to protect" lives on the profile, not the link
+    expect(payload.inlineSettings.backupMode).toBeUndefined();
+    expect(payload.inlineSettings.targets).toBeUndefined();
+  });
+
+  it('custom mode: save clears featurePolicyId and carries the destination inline', async () => {
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={baseLink}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    await screen.findByText('Primary S3');
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(saveMock).toHaveBeenCalled());
+    expect(saveMock).toHaveBeenCalledWith(
+      'link-1',
+      expect.objectContaining({
+        // Legacy featurePolicyId-as-destination is migrated on save
+        featurePolicyId: null,
+        inlineSettings: expect.objectContaining({
+          destinationConfigId: 'config-1',
+          backupMode: 'file',
+        }),
+      }),
+    );
+  });
+  // A failed /backup/profiles fetch used to render as "no profiles yet". A user
+  // looking at that false-empty picker can reasonably switch to "custom" and
+  // save — permanently converting a profile link on the basis of data that
+  // never arrived. Surface the failure and refuse the save instead.
+  it('profile fetch failure: shows an error instead of the empty picker, and blocks converting an existing profile link', async () => {
+    const profileLink = {
+      id: 'link-1',
+      featureType: 'backup',
+      featurePolicyId: 'prof-1',
+      inlineSettings: { backupProfileId: 'prof-1', schedule: { frequency: 'daily', time: '02:00' } },
+    };
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url === '/backup/configs' && method === 'GET') {
+        return makeJsonResponse({ data: [baseConfig] });
+      }
+      // The profile list is down.
+      if (url === '/backup/profiles' && method === 'GET') {
+        return makeJsonResponse({ error: 'boom' }, false, 500);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={profileLink as never}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    // The picker must NOT claim the org has no profiles.
+    expect(await screen.findByTestId('backup-profiles-load-error')).toBeTruthy();
+    expect(screen.queryByText(/No backup profiles yet/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    // The link is never rewritten from a list we failed to load.
+    await waitFor(() => expect(screen.getByTestId('backup-profiles-load-error')).toBeTruthy());
+    expect(saveMock).not.toHaveBeenCalled();
+  });
+
+  it('destination fetch failure: shows an error instead of the create-first-destination form', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      // The destination list is down — the org may well have destinations.
+      if (url === '/backup/configs' && method === 'GET') {
+        return makeJsonResponse({ error: 'boom' }, false, 500);
+      }
+      if (url === '/backup/profiles' && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={undefined}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByTestId('backup-destinations-load-error')).toBeTruthy();
+    // The create form must not auto-open over a load failure.
+    expect(screen.queryByText(/Editing storage configuration/i)).toBeNull();
   });
 });
