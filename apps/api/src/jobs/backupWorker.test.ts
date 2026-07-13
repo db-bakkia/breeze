@@ -29,14 +29,52 @@ describe('resolveBackupTargets', () => {
     mockDb.limit.mockResolvedValue([]);
   });
 
-  it('returns file targets unchanged', async () => {
+  it('returns file targets unchanged, omitting excludes when not configured', async () => {
+    // No excludes key at all — the agent treats a missing field as "fall back
+    // to locally-configured excludes", so the worker must not invent one.
     const result = await resolveBackupTargets(
       'file',
       { paths: ['/data', '/etc'] },
       'device-id'
     );
     expect(result).toEqual([
-      { commandType: 'backup_run', payload: { paths: ['/data', '/etc'] } },
+      {
+        commandType: 'backup_run',
+        payload: { paths: ['/data', '/etc'] },
+      },
+    ]);
+    expect(result[0]!.payload).not.toHaveProperty('excludes');
+  });
+
+  it('forwards an explicit empty excludes list for file mode', async () => {
+    // Explicit [] means "no exclusions for this run" on the agent side.
+    const result = await resolveBackupTargets(
+      'file',
+      { paths: ['/data'], excludes: [] },
+      'device-id'
+    );
+    expect(result).toEqual([
+      { commandType: 'backup_run', payload: { paths: ['/data'], excludes: [] } },
+    ]);
+  });
+
+  it('forwards exclusion patterns for file mode (#2418)', async () => {
+    const result = await resolveBackupTargets(
+      'file',
+      {
+        paths: ['C:\\Users'],
+        excludes: ['*.tmp', 'node_modules/**', '**/AppData/Local/Temp/**'],
+      },
+      'device-id'
+    );
+    expect(result).toEqual([
+      {
+        commandType: 'backup_run',
+        payload: {
+          paths: ['C:\\Users'],
+          excludes: ['*.tmp', 'node_modules/**', '**/AppData/Local/Temp/**'],
+        },
+      },
     ]);
   });
 
@@ -250,7 +288,7 @@ describe('resolveBackupTargets', () => {
     expect(result).toEqual([]);
   });
 
-  it('returns empty paths array for file mode when paths not provided', async () => {
+  it('returns empty paths and no excludes field for file mode when not provided', async () => {
     const result = await resolveBackupTargets('file', {}, 'device-id');
     expect(result).toEqual([
       { commandType: 'backup_run', payload: { paths: [] } },
