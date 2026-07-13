@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { redactSecretsFromOutput } from './secretRedaction';
+import {
+  redactSecretsFromOutput,
+  redactOptionalSecretText,
+  redactAgentResultErrorFields,
+  redactSecretsDeep,
+} from './secretRedaction';
 
 // A representative base64 body line that must never survive redaction.
 const KEY_BODY = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDb1234567890abcd';
@@ -126,5 +131,116 @@ describe('redactSecretsFromOutput', () => {
     const out = redactSecretsFromOutput(`JWT ${jwt} done`);
     expect(out).not.toContain(jwt);
     expect(out).toContain('[JWT_REDACTED]');
+  });
+});
+
+describe('redactOptionalSecretText (#2434)', () => {
+  it('preserves null and undefined', () => {
+    expect(redactOptionalSecretText(null)).toBeNull();
+    expect(redactOptionalSecretText(undefined)).toBeUndefined();
+  });
+
+  it('redacts a non-null value', () => {
+    const out = redactOptionalSecretText('password=SuperSecret123');
+    expect(out).not.toContain('SuperSecret123');
+  });
+});
+
+describe('redactAgentResultErrorFields (#2434 chokepoint)', () => {
+  const pem =
+    '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKe0m0h\n-----END RSA PRIVATE KEY-----';
+
+  it('redacts error and stderr but leaves stdout and structured result untouched', () => {
+    const result = {
+      status: 'failed',
+      stdout: `stdout keeps raw: ${pem}`,
+      stderr: `stderr: ${pem}`,
+      error: `error: ${pem}`,
+      result: { key: pem },
+    };
+    const out = redactAgentResultErrorFields(result);
+    expect(out.error).toContain('[PRIVATE_KEY_REDACTED]');
+    expect(out.stderr).toContain('[PRIVATE_KEY_REDACTED]');
+    // stdout is deliberately untouched here (structured-JSON consumers +
+    // capture_pprof artifacts) — its persisted forms are redacted per-site.
+    expect(out.stdout).toContain('BEGIN RSA PRIVATE KEY');
+    expect(out.result).toBe(result.result);
+    expect(out.status).toBe('failed');
+  });
+
+  it('returns the same object when there is nothing to redact', () => {
+    const result: { status: 'completed'; error?: string; stderr?: string } = {
+      status: 'completed',
+    };
+    expect(redactAgentResultErrorFields(result)).toBe(result);
+  });
+});
+
+describe('redactSecretsDeep (#2434)', () => {
+  const pem =
+    '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKe0m0h\n-----END RSA PRIVATE KEY-----';
+
+  it('redacts strings nested in objects and arrays', () => {
+    const out = redactSecretsDeep({
+      error: `top: ${pem}`,
+      list: [`item: ${pem}`, 42, null],
+      nested: { deeper: { hint: `deep: ${pem}` } },
+      count: 3,
+      flag: true,
+    }) as Record<string, unknown>;
+
+    expect(JSON.stringify(out)).not.toContain('BEGIN RSA PRIVATE KEY');
+    expect(out.error).toContain('[PRIVATE_KEY_REDACTED]');
+    expect((out.list as unknown[])[0]).toContain('[PRIVATE_KEY_REDACTED]');
+    expect((out.list as unknown[])[1]).toBe(42);
+    expect(((out.nested as any).deeper.hint)).toContain('[PRIVATE_KEY_REDACTED]');
+    expect(out.count).toBe(3);
+    expect(out.flag).toBe(true);
+  });
+
+  it('passes through scalars and nullish values', () => {
+    expect(redactSecretsDeep(null)).toBeNull();
+    expect(redactSecretsDeep(7)).toBe(7);
+    expect(redactSecretsDeep(undefined)).toBeUndefined();
+  });
+
+  it('FAILS CLOSED past the recursion bound — an over-nested secret cannot escape', () => {
+    // A hostile agent nests the key deeper than the recursion bound to dodge
+    // redaction. If the bound returned the subtree as-is, this would persist
+    // the PEM verbatim. 64 levels is double MAX_DEEP_REDACTION_DEPTH.
+    let nested: Record<string, unknown> = { key: pem };
+    for (let i = 0; i < 64; i++) nested = { deeper: nested };
+
+    const out = redactSecretsDeep(nested);
+    const serialized = JSON.stringify(out);
+    expect(serialized).toContain('[PRIVATE_KEY_REDACTED]');
+    expect(serialized).not.toContain('BEGIN RSA PRIVATE KEY');
+    expect(serialized).not.toContain('MIIBOgIBAAJBAKe0m0h');
+  });
+
+  it('passes a Date through BY REFERENCE — a generic walk would flatten it to {}', () => {
+    // Object.entries(new Date()) === [], so an unguarded walk rebuilds a Date as
+    // {} and it loses toISOString(). Drizzle's timestamp mapper then throws on
+    // insert, the caller's try/catch swallows it, and the row silently never
+    // persists (this shipped as a real bug in the first cut of this PR: it took
+    // out the CIS *success* path while failed scans kept writing).
+    const checkedAt = new Date('2026-07-13T00:00:00Z');
+    const out = redactSecretsDeep({
+      checkedAt,
+      findings: [{ message: `key: ${pem}` }],
+    }) as { checkedAt: unknown; findings: unknown };
+
+    expect(out.checkedAt).toBeInstanceOf(Date);
+    expect((out.checkedAt as Date).toISOString()).toBe('2026-07-13T00:00:00.000Z');
+    // ...while still redacting the strings alongside it.
+    expect(JSON.stringify(out.findings)).toContain('[PRIVATE_KEY_REDACTED]');
+  });
+
+  it('does not hang or leak on a cyclic structure', () => {
+    const cyclic: Record<string, unknown> = { note: `key: ${pem}` };
+    cyclic.self = cyclic;
+
+    const serialized = JSON.stringify(redactSecretsDeep(cyclic));
+    expect(serialized).not.toContain('BEGIN RSA PRIVATE KEY');
   });
 });

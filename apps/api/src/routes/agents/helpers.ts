@@ -57,6 +57,7 @@ import { recordSoftwarePolicyAudit } from '../../services/softwarePolicyService'
 import { resolvePatchConfigForDevice } from '../../services/featureConfigResolver';
 import { resolveUserGroupMembershipCached } from '../../services/onedriveGraph';
 import { captureException } from '../../services/sentry';
+import { redactSecretsDeep, redactOptionalSecretText } from '../../services/secretRedaction';
 import { CloudflareMtlsService } from '../../services/cloudflareMtls';
 import { isAllowedPolicyConfigProbe } from './policyProbeSafety';
 import { PAM_DEFAULTS, parsePamSettings, type PamSettings } from './pamSettings';
@@ -651,7 +652,11 @@ export async function handleSecurityCommandResult(
           filePath: asString(threat.path) ?? asString(threat.filePath) ?? null,
           processName: asString(threat.processName) ?? null,
           detectedAt: completedAt,
-          details: threat
+          // #2434: `threat` is the raw agent/AV threat object parsed out of
+          // stdout (stdout is deliberately NOT redacted at the ingest
+          // chokepoint). AV records routinely embed the offending command line
+          // or script fragment, so redact every string in the blob.
+          details: redactSecretsDeep(threat)
         });
       }
 
@@ -827,7 +832,8 @@ export async function handleSensitiveDataCommandResult(
           ...existingSummary,
           commandId: command.id,
           commandStatus: resultData.status,
-          agentSummary: scanSummary,
+          // #2434: agent-supplied summary blob parsed from raw stdout.
+          agentSummary: redactSecretsDeep(scanSummary),
           findingsCount: dedupedFindings.length,
           findings: {
             total: dedupedFindings.length,
@@ -1062,7 +1068,11 @@ export async function handleSoftwareRemediationCommandResult(
       commandId: command.id,
       softwareName,
       softwareVersion: softwareVersion ?? null,
-      message: resultData.error ?? resultData.stderr ?? 'Uninstall command failed',
+      // #2434: self-redact rather than depend on the ingest chokepoint two
+      // modules away (idempotent — already-redacted text passes through).
+      message: redactOptionalSecretText(resultData.error)
+        ?? redactOptionalSecretText(resultData.stderr)
+        ?? 'Uninstall command failed',
       status: resultData.status,
       exitCode: resultData.exitCode ?? null,
       failedAt: new Date().toISOString(),
@@ -1091,7 +1101,8 @@ export async function handleSoftwareRemediationCommandResult(
         softwareVersion: softwareVersion ?? null,
         commandStatus: resultData.status,
         exitCode: resultData.exitCode ?? null,
-        error: resultData.error ?? null,
+        // #2434: self-redact (see above) — this lands in audit_logs.details.
+        error: redactOptionalSecretText(resultData.error) ?? null,
       },
     }).catch((err) => {
       console.error('[agents/helpers] Audit write failed for remediation_command_failed:', err);
@@ -1210,8 +1221,33 @@ export async function handleCisCommandResult(
       .orderBy(desc(cisBaselineResults.checkedAt))
       .limit(1);
 
-    let parsed = parseCisCollectorOutput(resultData.stdout);
+    // #2434: the success path parses findings out of RAW stdout (stdout is not
+    // redacted at the ingest chokepoint), and each finding carries free-text
+    // `message` / `evidence` / `remediation` produced by the collector — a
+    // failing check's evidence can quote the very config value (connection
+    // string, service-account password) that made it fail.
+    //
+    // Redact only the JSON-safe sub-parts. Do NOT hand the whole object to
+    // redactSecretsDeep: `checkedAt` is a Date, and a generic object walk
+    // would rebuild it as `{}` (Object.entries(new Date()) === []), which
+    // makes Drizzle's timestamp mapper throw on insert — a throw the caller
+    // swallows, so successful scans would silently stop persisting while
+    // failed ones (which rebuild checkedAt below) kept working.
+    const collected = parseCisCollectorOutput(resultData.stdout);
+    let parsed: ReturnType<typeof parseCisCollectorOutput> = {
+      ...collected,
+      findings: redactSecretsDeep(collected.findings) as typeof collected.findings,
+      rawSummary: redactSecretsDeep(collected.rawSummary) as typeof collected.rawSummary,
+    };
     if (resultData.status !== 'completed') {
+      // #2434: error/stderr arrive already-redacted from the ingest chokepoint,
+      // but redact again here rather than depending on a caller two modules
+      // away — this handler is reachable from both ingest legs and the
+      // failure branch writes agent text straight into a user-visible finding.
+      // Every sibling persistence service (backup/restore/vault) self-redacts
+      // for the same reason; redaction is idempotent, so this is free.
+      const failureError = redactOptionalSecretText(resultData.error);
+      const failureStderr = redactOptionalSecretText(resultData.stderr);
       parsed = {
         checkedAt: new Date(),
         findings: [{
@@ -1219,7 +1255,7 @@ export async function handleCisCommandResult(
           title: 'CIS collector execution',
           severity: 'high',
           status: 'fail',
-          message: resultData.error ?? resultData.stderr ?? 'CIS collector execution failed',
+          message: failureError ?? failureStderr ?? 'CIS collector execution failed',
           evidence: null,
           remediation: null,
         }],
@@ -1228,8 +1264,8 @@ export async function handleCisCommandResult(
         failedChecks: 1,
         score: 0,
         rawSummary: {
-          error: resultData.error ?? null,
-          stderr: resultData.stderr ?? null,
+          error: failureError ?? null,
+          stderr: failureStderr ?? null,
           status: resultData.status,
         },
       };
@@ -1379,15 +1415,21 @@ export async function handleCisCommandResult(
     completedAt: new Date().toISOString(),
   };
 
+  // #2434: resultDetails / beforeState / afterState / rollbackHint are all
+  // derived from RAW stdout (unredacted at the chokepoint). before/afterState
+  // hold the ACTUAL values of the registry keys or config the remediation
+  // changed — a service-account password living in a registry value would be
+  // persisted verbatim and rendered in the CIS UI. Redaction is idempotent, so
+  // the already-redacted error/stderr in updatedDetails pass through unharmed.
   await db
     .update(cisRemediationActions)
     .set({
       status: completed ? 'completed' : 'failed',
       executedAt: new Date(),
-      details: updatedDetails,
-      beforeState: beforeStateFromResult ?? action.beforeState ?? null,
-      afterState: afterStateFromResult ?? action.afterState ?? null,
-      rollbackHint: rollbackHint ?? null,
+      details: redactSecretsDeep(updatedDetails) as Record<string, unknown>,
+      beforeState: redactSecretsDeep(beforeStateFromResult ?? action.beforeState ?? null) as Record<string, unknown> | null,
+      afterState: redactSecretsDeep(afterStateFromResult ?? action.afterState ?? null) as Record<string, unknown> | null,
+      rollbackHint: redactOptionalSecretText(rollbackHint ?? null),
     })
     .where(eq(cisRemediationActions.id, action.id));
 
