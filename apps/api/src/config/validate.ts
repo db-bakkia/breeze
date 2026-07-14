@@ -341,12 +341,19 @@ const envSchema = z
         (v) => !v || v.startsWith('postgres://') || v.startsWith('postgresql://'),
         { message: 'DATABASE_URL_APP must be a valid postgres:// or postgresql:// URL' },
       )
-      .describe('Optional unprivileged application DB connection. If unset, falls back to DATABASE_URL.'),
+      .describe(
+        'Explicit unprivileged request DB connection. If unset, Breeze derives the breeze_app URL using BREEZE_APP_DB_PASSWORD or POSTGRES_PASSWORD; production refuses direct DATABASE_URL fallback.',
+      ),
 
     BREEZE_APP_DB_PASSWORD: z
       .string()
       .optional()
       .describe('Password for the breeze_app role. If unset, ensureAppRole falls back to POSTGRES_PASSWORD.'),
+
+    POSTGRES_PASSWORD: z
+      .string()
+      .optional()
+      .describe('Standard Compose PostgreSQL password and fallback breeze_app derivation credential.'),
 
     // Issue #915: dedicated connection string for the `breeze_audit_admin`
     // login role used ONLY by the audit-log retention worker. When set,
@@ -560,6 +567,20 @@ const envSchema = z
   // --- Cross-field refinements (insecure defaults for required secrets) -------
   .superRefine((data, ctx) => {
     const isProduction = data.NODE_ENV === 'production';
+
+    if (
+      isProduction
+      && !data.DATABASE_URL_APP?.trim()
+      && !data.BREEZE_APP_DB_PASSWORD?.trim()
+      && !data.POSTGRES_PASSWORD?.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DATABASE_URL_APP'],
+        message:
+          'Production requires DATABASE_URL_APP, BREEZE_APP_DB_PASSWORD, or POSTGRES_PASSWORD to configure the unprivileged request database role.',
+      });
+    }
 
     // #2288 — instance-level backup control-plane URL pushed to agents.
     // Malformed value = refuse to boot; a silently-dropped backup URL would
@@ -1344,6 +1365,7 @@ export function validateConfig(): AppConfig {
     DATABASE_URL: env.DATABASE_URL,
     DATABASE_URL_APP: env.DATABASE_URL_APP,
     BREEZE_APP_DB_PASSWORD: env.BREEZE_APP_DB_PASSWORD,
+    POSTGRES_PASSWORD: env.POSTGRES_PASSWORD,
     AUDIT_ADMIN_DATABASE_URL: env.AUDIT_ADMIN_DATABASE_URL,
     JWT_SECRET: env.JWT_SECRET,
     JWT_SIGNING_KEYRING: env.JWT_SIGNING_KEYRING,
