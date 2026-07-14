@@ -698,23 +698,80 @@ userRoutes.patch('/me', zValidator('json', updateMeSchema), async (c) => {
     return c.json({ error: 'No valid updates provided' }, 400);
   }
 
-  const [updated] = await db
-    .update(users)
-    .set(updates)
-    .where(eq(users.id, auth.user.id))
-    .returning({
-      id: users.id,
-      email: users.email,
-      name: users.name,
-      avatarUrl: users.avatarUrl,
-      status: users.status,
-      mfaEnabled: users.mfaEnabled,
-      preferences: users.preferences
-    });
+  const returningColumns = {
+    id: users.id,
+    email: users.email,
+    name: users.name,
+    avatarUrl: users.avatarUrl,
+    status: users.status,
+    mfaEnabled: users.mfaEnabled,
+    preferences: users.preferences
+  };
+
+  // An email change is an account-recovery-surface change: the new address can
+  // drive password reset and MFA recovery, so prior credentials must not
+  // survive it (#2428). Advance auth_epoch (kills every outstanding access
+  // token on its next request) AND email_epoch (kills every outstanding
+  // verification artifact bound to the OLD address), and durably revoke the
+  // refresh families — all in the SAME transaction as the email write, so a
+  // rollback undoes the sign-out with it. Scoped strictly to a genuine,
+  // step-up-cleared change (`previousEmail` set): a name/preferences edit, or
+  // a same-address PATCH, must never sign the user out.
+  //
+  // Runs in the caller's own request context, not a system context: this is a
+  // self-service handler writing the caller's OWN `users` row and OWN
+  // refresh_token_families rows, which the self/user-id-scoped RLS policies
+  // admit — same precedent as POST /auth/change-password.
+  const emailChanged = previousEmail !== undefined;
+
+  const [updated] = emailChanged
+    ? await db.transaction(async (tx) => {
+        const rows = await tx
+          .update(users)
+          // Clear `email_verified_at`: nobody has proven control of the NEW
+          // address yet. Leaving it set would carry the OLD address's
+          // verification over to an unproven one — the same false "verified"
+          // this PR's epoch gate stops a stale link from producing, just
+          // through the front door — and it would also strand the user, since
+          // /auth/resend-verification refuses to mint a link while the flag is
+          // set. Written only inside the transaction, deliberately NOT added to
+          // `updates`, so the audit's changedFields keeps listing exactly the
+          // fields the CALLER asked to change.
+          .set({ ...updates, emailVerifiedAt: null })
+          .where(eq(users.id, auth.user.id))
+          .returning(returningColumns);
+        // Only advance/revoke when the write actually landed — an RLS-filtered
+        // 0-row update must not bump an epoch for a row we never changed.
+        if (rows.length > 0) {
+          await advanceUserEpochs(tx, auth.user.id, { auth: true, email: true });
+          await revokeAllRefreshFamilies(tx, auth.user.id, 'email-change');
+        }
+        return rows;
+      })
+    : await db
+        .update(users)
+        .set(updates)
+        .where(eq(users.id, auth.user.id))
+        .returning(returningColumns);
 
   if (!updated) {
     return c.json({ error: 'Failed to update profile' }, 500);
   }
+
+  // Post-commit cleanup after an email change: Redis JWT cutoff, permission
+  // cache clear, and the MCP OAuth grant sweep — the EdDSA bearer path never
+  // sees user-JWT epochs, so those grants must be revoked out-of-band or an
+  // MCP token minted before the change keeps working. Best-effort per step and
+  // never throws; the durable revocation above is already committed.
+  //
+  // Deliberately NOT surfaced as a 503 the way the admin suspension path does
+  // (see the status-change PATCH below). That path is retry-safe; this one is
+  // NOT — on a retry the address already equals `self.email`, so `emailChanging`
+  // is false and the whole epoch/revoke/cleanup block is skipped. A 503 telling
+  // the caller to retry would instruct them to run a provable no-op. Instead the
+  // per-step outcome goes into the email-change audit (below): a surviving MCP
+  // bearer after a failed sweep must leave a trace beyond a Sentry event.
+  const cleanup = emailChanged ? await runPostCommitCleanup(auth.user.id) : undefined;
 
   // Every successful self-profile change MUST be audited regardless of caller
   // scope (SOC2 coverage). Partner-scope callers have auth.orgId === null, so
@@ -752,7 +809,17 @@ userRoutes.patch('/me', zValidator('json', updateMeSchema), async (c) => {
       details: {
         previousEmail,
         newEmail: updated.email,
-        stepUp: stepUpMethod
+        stepUp: stepUpMethod,
+        // Revocation outcome (#2428). The durable half — epoch advance +
+        // refresh-family revoke — committed or the request would have failed.
+        // These record whether the best-effort half reached Redis, the
+        // permission cache and the MCP OAuth grants, so a bearer that survived
+        // a failed sweep is visible to an auditor, not only to Sentry.
+        sessionsRevoked: true,
+        redisCutoffOk: cleanup?.redisOk,
+        permissionCacheCleared: cleanup?.permissionCacheOk,
+        oauthGrantsRevokedOk: cleanup?.oauthOk,
+        oauthArtifactsRevoked: cleanup?.oauthResult
       },
       ipAddress: getTrustedClientIpOrUndefined(c),
       userAgent: c.req.header('user-agent'),
