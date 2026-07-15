@@ -54,7 +54,8 @@ import {
   auditUserLoginFailure,
   auditLogin,
   userRequiresSetup,
-  userHasUsablePasskey
+  userHasUsablePasskey,
+  authResponseFloorPromise
 } from './helpers';
 import { assertPasswordAuthAllowedBySso, SsoPasswordAuthRequiredError } from './ssoPolicy';
 import { readMobileDeviceId, carryForwardBinding } from '../../services/mobileDeviceBinding';
@@ -95,27 +96,11 @@ function getDummyPasswordHash(): Promise<string> {
 // (fragile — any new denial branch added later silently regresses the
 // equalization), we floor the entire handler's wall-clock latency at a
 // fixed budget. Every response (success, 401, 429, MFA-required) waits
-// until at least LOGIN_RESPONSE_FLOOR_MS has elapsed.
+// until the shared AUTH_RESPONSE_FLOOR_MS budget has elapsed.
 //
-// Budget calibration: argon2id default params take ~100-200ms on prod
-// hardware; tenant-context DB joins add ~30-80ms; rate-limit Redis ops
-// add ~5-10ms. 350ms is a safe upper bound that comfortably exceeds the
-// slowest legitimate path while staying well below interactive-feel
-// thresholds (200ms = "instant", 500ms+ = "sluggish").
-//
-// Test/E2E mode skips the floor so the test suite stays fast — the unit
-// tests don't measure timing, only state.
-const LOGIN_RESPONSE_FLOOR_MS = 350;
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function loginResponseFloorPromise(): Promise<void> {
-  if (process.env.NODE_ENV === 'test') return Promise.resolve();
-  if (process.env.E2E_MODE === '1' || process.env.E2E_MODE === 'true') return Promise.resolve();
-  return delay(LOGIN_RESPONSE_FLOOR_MS);
-}
+// SR2-22 shares this exact equalizer (now `authResponseFloorPromise` in
+// ./helpers) with /forgot-password rather than defining a second one.
+const loginResponseFloorPromise = authResponseFloorPromise;
 
 // Task 10 helper: bump the per-account failure counter, and if THIS
 // attempt is the one that crossed the lockout threshold, fire a security
@@ -298,34 +283,59 @@ loginRoutes.post('/login', cfAccessLoginMiddleware, zValidator('json', loginSche
 
   // Task 10: per-account lockout check. Runs AFTER the user lookup so
   // a locked vs unlocked email isn't observable via timing — the timing
-  // already says "this email exists" since we ran a real argon2 verify
-  // above on the user-found branch, so an additional Redis GET here
-  // doesn't leak any new information. Important: returning 429 even
+  // already says "this email exists" since we run a real argon2 verify
+  // below on the user-found branch, so an additional Redis GET here
+  // doesn't leak any new information. Important: DENYING the login even
   // when the password is correct is the whole point — a locked account
   // means "we don't trust this session right now", not "your password
-  // is wrong". The lockout window expires automatically; the user can
+  // is wrong". The response shape is the generic 401 (SR2-23), but the
+  // denial stands. The lockout window expires automatically; the user can
   // also unblock themselves by completing a password reset.
-  if (!e2eMode) {
-    const redisForLock = getRedis();
-    if (await isAccountLocked(redisForLock, normalizedEmail)) {
-      void auditUserLoginFailure(c, {
-        userId: user.id,
-        email: user.email,
-        name: user.name,
-        reason: 'account_locked',
-        result: 'denied',
-        details: { method: 'password' }
-      });
-      await floorPromise;
-      return c.json({
-        error: 'Account temporarily locked due to repeated failed sign-ins. Try again in 15 minutes or reset your password.',
-        retryAfter: getAccountLockoutWindowSeconds()
-      }, 429);
-    }
+  //
+  // SR2-23: this is a FLAG, not an early return. The old code short-circuited
+  // here, which meant a locked account skipped the argon2 verify below and
+  // answered measurably sooner than a live account whenever argon2 outruns the
+  // wall-clock floor — moving the enumeration oracle from the body into the
+  // latency. Both denial paths now do identical work: one Redis GET, one argon2
+  // verify, one floored 401.
+  const accountLocked = e2eMode
+    ? false
+    : await isAccountLocked(getRedis(), normalizedEmail);
+
+  // Verify password. Runs unconditionally — see the SR2-23 note above; the
+  // result is discarded on the locked branch (a locked account is denied
+  // regardless of whether the password was right).
+  const validPassword = await verifyPassword(user.passwordHash, password);
+
+  if (accountLocked) {
+    void auditUserLoginFailure(c, {
+      userId: user.id,
+      email: user.email,
+      name: user.name,
+      reason: 'account_locked',
+      result: 'denied',
+      details: { method: 'password' }
+    });
+    // SR2-23: the public response is the SAME generic 401 an unknown email or
+    // a wrong password gets — same status, same body, same headers, floored on
+    // the same clock. The previous `429 { error: 'Account temporarily locked…',
+    // retryAfter }` was a pure account-existence oracle: unknown emails never
+    // lock (we deliberately do not bump their failure counter — see the miss
+    // branch above), so seeing that body proved the address had an account
+    // without ever guessing the password.
+    //
+    // The owner is still told — out of band, in the lockout email that
+    // recordAccountFailureAndMaybeNotify already sends to the address itself,
+    // which is the only channel that proves ownership. Ops still get the audit
+    // row + the anomaly metric. Only the attacker loses a signal.
+    //
+    // We deliberately do NOT bump the failure counter here: an already-locked
+    // account re-bumping on every attempt would let an attacker hold a victim
+    // locked out indefinitely, turning the control into a DoS amplifier.
+    await floorPromise;
+    return c.json(genericAuthError(), 401);
   }
 
-  // Verify password
-  const validPassword = await verifyPassword(user.passwordHash, password);
   if (!validPassword) {
     // Task 10: bump the per-account failure counter. If THIS attempt is
     // the one that crosses the threshold, fire the lockout-notice email

@@ -45,6 +45,26 @@ export const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T>
   return typeof withSystem === 'function' ? withSystem(fn) : fn();
 };
 
+// Shared floor-the-clock timing equalizer for pre-auth endpoints whose latency
+// would otherwise be an account-enumeration oracle (login audit finding H-4;
+// forgot-password SR2-22). The slowest legitimate path (real user, SSO/tenant
+// joins, argon2) runs materially longer than the cheap "no such account" path;
+// flooring every response at a fixed budget collapses that delta. 350ms
+// comfortably exceeds the slowest legitimate path while staying below the
+// interactive-feel "sluggish" threshold (500ms+). Test/E2E mode skips the floor
+// so suites stay fast — unit tests assert state, not wall-clock.
+export const AUTH_RESPONSE_FLOOR_MS = 350;
+
+function authResponseFloorDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function authResponseFloorPromise(): Promise<void> {
+  if (process.env.NODE_ENV === 'test') return Promise.resolve();
+  if (process.env.E2E_MODE === '1' || process.env.E2E_MODE === 'true') return Promise.resolve();
+  return authResponseFloorDelay(AUTH_RESPONSE_FLOOR_MS);
+}
+
 /**
  * #2153: does the account have at least one usable (non-disabled) passkey?
  *
@@ -242,10 +262,16 @@ export async function userIsMfaProtected(userId: string): Promise<boolean> {
  * mint time) so a factor change since the grant was minted (which bumps
  * `mfa_epoch` + revokes refresh families) invalidates it.
  *
- * `opts.consume: false` = non-consuming validate (register/options, which is
- * followed by a separate /verify that consumes the SAME grant).
- * `opts.consume: true` = single-use consume (every terminal factor write:
- * /mfa/enable, setup-confirm, /mfa/sms/enable, /passkeys/register/verify).
+ * Every factor-addition route calls this TWICE, in two phases:
+ *
+ * `opts.consume: false` = non-consuming validate, at the gate. Runs before the
+ * factor proof (TOTP/SMS code, WebAuthn assertion) so a missing/bogus/stale
+ * grant 403s without burning the consuming TOTP verifier's time-step.
+ * `opts.consume: true` = single-use consume, immediately before the terminal
+ * write, once the factor proof has validated. A wrong code therefore leaves the
+ * grant intact for a retry, while a successful add burns it exactly once (the
+ * consume re-checks the binding against the LIVE epochs and fails CLOSED, so
+ * one grant can never write two factors).
  *
  * Returns a 403/503 Response to short-circuit the caller, or null to proceed.
  */
