@@ -65,6 +65,17 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   { method: 'POST', pattern: /^\/api\/v1\/sso\/providers\/?$/ },
   { method: 'PATCH', pattern: /^\/api\/v1\/sso\/providers\/[^/]+\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/sso\/providers\/[^/]+\/test\/?$/ },
+  // Pax8 order line authoring may fetch product commitment dependencies. The
+  // service re-enters short partner-scoped DB contexts around each DB phase,
+  // with the Pax8 HTTP request running after those contexts close.
+  { method: 'POST', pattern: /^\/api\/v1\/pax8\/orders\/[^/]+\/lines\/?$/ },
+  // Pax8 preflight, submit, and human reconciliation likewise split DB claims
+  // and result persistence around Pax8 HTTP. Pax8 writes are never retried.
+  { method: 'POST', pattern: /^\/api\/v1\/pax8\/orders\/[^/]+\/(?:preflight|submit|reconcile)\/?$/ },
+  // Dynamic Pax8 order forms proxy product metadata. The route reads and
+  // decrypts the active integration in one short partner context, then closes
+  // it before making the outbound request.
+  { method: 'GET', pattern: /^\/api\/v1\/pax8\/products\/[^/]+\/(?:provision-details|dependencies)\/?$/ },
 ];
 
 /**

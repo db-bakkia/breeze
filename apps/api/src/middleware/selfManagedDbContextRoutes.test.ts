@@ -36,6 +36,22 @@ describe('isSelfManagedDbContextRoute', () => {
     ['patch', '/api/v1/sso/providers/abc-123'], // method is case-insensitive
     ['POST', '/api/v1/sso/providers/abc-123/test'],
     ['POST', '/api/v1/sso/providers/abc-123/test/'],
+    // Pax8 line authoring may fetch commitment dependencies from Pax8.
+    ['POST', '/api/v1/pax8/orders/ord-1/lines'],
+    ['POST', '/api/v1/pax8/orders/ord-1/lines/'],
+    ['post', '/api/v1/pax8/orders/ord-1/lines'], // method is case-insensitive
+    // Pax8 submit/reconcile phases make outbound calls between short DB txns.
+    ['POST', '/api/v1/pax8/orders/ord-1/preflight'],
+    ['POST', '/api/v1/pax8/orders/ord-1/preflight/'],
+    ['POST', '/api/v1/pax8/orders/ord-1/submit'],
+    ['POST', '/api/v1/pax8/orders/ord-1/submit/'],
+    ['POST', '/api/v1/pax8/orders/ord-1/reconcile'],
+    ['POST', '/api/v1/pax8/orders/ord-1/reconcile/'],
+    // Product form metadata proxies Pax8 HTTP after a short credential read.
+    ['GET', '/api/v1/pax8/products/prod-1/provision-details'],
+    ['GET', '/api/v1/pax8/products/prod-1/provision-details/'],
+    ['GET', '/api/v1/pax8/products/prod-1/dependencies'],
+    ['GET', '/api/v1/pax8/products/prod-1/dependencies/'],
   ];
 
   const NO_MATCH: ReadonlyArray<[string, string, string]> = [
@@ -78,6 +94,17 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/sso/providers/abc-123/test/extra', 'extra segment must not match'],
     ['POST', '/api/v1/sso/domains', 'domain routes are DB-only'],
     ['POST', '/api/v1/sso/link/start/abc-123', 'link start is DB-only'],
+    ['GET', '/api/v1/pax8/orders/ord-1/lines', 'Pax8 line authoring is POST-only'],
+    ['POST', '/api/v1/pax8/orders//lines', 'Pax8 order id must not be empty'],
+    ['POST', '/api/v1/pax8/orders/ord-1/lines/extra', 'extra segment must not match'],
+    ['GET', '/api/v1/pax8/orders/ord-1/preflight', 'Pax8 preflight is POST-only'],
+    ['GET', '/api/v1/pax8/orders/ord-1/submit', 'Pax8 submit is POST-only'],
+    ['GET', '/api/v1/pax8/orders/ord-1/reconcile', 'Pax8 reconcile is POST-only'],
+    ['POST', '/api/v1/pax8/orders//submit', 'Pax8 order id must not be empty'],
+    ['POST', '/api/v1/pax8/orders/ord-1/submit/extra', 'extra segment must not match'],
+    ['POST', '/api/v1/pax8/products/prod-1/dependencies', 'Pax8 product metadata routes are GET-only'],
+    ['GET', '/api/v1/pax8/products//dependencies', 'Pax8 product id must not be empty'],
+    ['GET', '/api/v1/pax8/products/prod-1/dependencies/extra', 'extra segment must not match'],
   ];
 
   it.each(MATCH)('opts out: %s %s', (method, path) => {
