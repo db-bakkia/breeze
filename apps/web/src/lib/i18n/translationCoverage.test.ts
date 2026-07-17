@@ -16,7 +16,7 @@ const namespaceDuplicateBaselines = {
     'ai.json': 1,
     'alerts.json': 43,
     'auth.json': 14,
-    'backup.json': 51,
+    'backup.json': 52,
     // +4: contract-template format strings + Portuguese cognate ("v{{number}} ·
     // {{status}}", "v{{number}}", "{{name}} — v{{number}}", "Status")
     // legitimately identical to English.
@@ -45,7 +45,7 @@ const namespaceDuplicateBaselines = {
     'ai.json': 4,
     'alerts.json': 39,
     'auth.json': 14,
-    'backup.json': 29,
+    'backup.json': 30,
     // +3: contract-template format strings ("v{{number}} · {{status}}",
     // "v{{number}}", "{{name}} — v{{number}}") that are legitimately identical
     // to English in es-419.
@@ -73,7 +73,7 @@ const namespaceDuplicateBaselines = {
     'ai.json': 9,
     'alerts.json': 58,
     'auth.json': 13,
-    'backup.json': 58,
+    'backup.json': 59,
     // +7: contract-template format strings + French cognates ("v{{number}} ·
     // {{status}}", "v{{number}}", "{{name}} — v{{number}}", "Description",
     // "Versions", "Documents" ×2) that are legitimately identical to English
@@ -102,7 +102,7 @@ const namespaceDuplicateBaselines = {
     'ai.json': 5,
     'alerts.json': 46,
     'auth.json': 15,
-    'backup.json': 62,
+    'backup.json': 63,
     // +6: contract-template format strings + German cognates ("v{{number}} ·
     // {{status}}", "v{{number}}", "{{name}} — v{{number}}", "Name", "Status")
     // that are legitimately identical to English in de-DE.
