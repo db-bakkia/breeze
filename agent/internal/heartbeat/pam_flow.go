@@ -128,7 +128,8 @@ func (h *Heartbeat) RunPamFlow(ctx context.Context, ev etwlua.Event, outcome etw
 		func() {
 			actCtx, cancel := context.WithTimeout(ctx, 2*defaultActuateTimeoutMs*time.Millisecond)
 			defer cancel()
-			res := h.actuateElevation(actCtx, outcome.RequestID, defaultActuateTimeoutMs)
+			res := h.actuateElevation(actCtx, outcome.RequestID, defaultActuateTimeoutMs,
+				pamTarget{Path: ev.TargetExecutablePath, CommandLine: ev.CommandLine, SubjectUsername: ev.SubjectUsername})
 			if res.Success {
 				log.Info("pam: local actuation complete", "elevationRequestId", outcome.RequestID, "success", true, "reason", res.Reason)
 			} else {
