@@ -15,6 +15,17 @@ import { db } from '../../db';
 import { aiSessions, aiMessages, devices } from '../../db/schema';
 import { streamingSessionManager } from '../../services/streamingSessionManager';
 import { buildHelperSystemPrompt } from '../../services/helperAiAgent';
+import {
+  clientToolsSchema,
+  createClientDeclaredMcpServer,
+  clientDeclaredToolMcpNames,
+  requestClientDeclaredTool,
+  resolveClientDeclaredTool,
+  peekClientDeclaredToolName,
+  failPendingClientDeclaredForSession,
+  CLIENT_DECLARED_MCP_SERVER_NAME,
+  type ClientToolDeclaration,
+} from '../../services/clientSessionTools';
 import { getHelperAllowedMcpToolNames, type HelperPermissionLevel } from '../../services/helperToolFilter';
 import { resolveHelperPermissionLevelForDevice } from '../../services/helperPermissions';
 import { sanitizeUserMessage } from '../../services/aiInputSanitizer';
@@ -40,12 +51,19 @@ helperRoutes.use('*', helperAuth);
 // Helper Pre-flight Checks
 // ============================================
 
+/** Read persisted client-declared tools (stored in contextSnapshot at create). */
+function clientToolsFromSession(session: typeof aiSessions.$inferSelect): ClientToolDeclaration[] {
+  const snapshot = session.contextSnapshot as Record<string, unknown> | null;
+  const raw = snapshot?.clientTools;
+  return Array.isArray(raw) ? (raw as ClientToolDeclaration[]) : [];
+}
+
 async function runHelperPreFlight(
   sessionId: string,
   content: string,
   device: HelperDevice,
 ): Promise<
-  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[] }
+  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[]; clientTools: ClientToolDeclaration[] }
   | { ok: false; error: string; status: number }
 > {
   // Fetch session
@@ -104,6 +122,12 @@ async function runHelperPreFlight(
 
   const permissionLevel = await resolveHelperPermissionLevelForDevice(device.id, DEFAULT_PERMISSION_LEVEL);
 
+  // When the session declared its own tools, the model runs against THOSE
+  // (client-declared MCP server + their allowlist) instead of the built-in
+  // device toolset — the generic client-tools seam.
+  const clientTools = clientToolsFromSession(session);
+  const hasClientTools = clientTools.length > 0;
+
   const systemPrompt = buildHelperSystemPrompt({
     hostname: device.hostname,
     deviceId: device.id,
@@ -112,9 +136,12 @@ async function runHelperPreFlight(
     osType: device.osType,
     osVersion: device.osVersion,
     agentVersion: device.agentVersion,
+    hasClientTools,
   });
 
-  const allowedTools = getHelperAllowedMcpToolNames(permissionLevel);
+  const allowedTools = hasClientTools
+    ? clientDeclaredToolMcpNames(clientTools)
+    : getHelperAllowedMcpToolNames(permissionLevel);
 
   let maxBudgetUsd: number | undefined;
   try {
@@ -124,7 +151,7 @@ async function runHelperPreFlight(
     // Non-fatal
   }
 
-  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd, allowedTools };
+  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd, allowedTools, clientTools };
 }
 
 // ============================================
@@ -147,6 +174,7 @@ helperRoutes.post(
   '/chat/sessions',
   zValidator('json', z.object({
     helperUser: z.string().max(100).optional(),
+    clientTools: clientToolsSchema.optional(),
   }).optional()),
   async (c) => {
     const device = c.get('helperDevice');
@@ -156,6 +184,9 @@ helperRoutes.post(
       DEFAULT_PERMISSION_LEVEL,
     );
 
+    const clientTools = body.clientTools ?? [];
+    const hasClientTools = clientTools.length > 0;
+
     const systemPrompt = buildHelperSystemPrompt({
       hostname: device.hostname,
       deviceId: device.id,
@@ -164,6 +195,7 @@ helperRoutes.post(
       osType: device.osType,
       osVersion: device.osVersion,
       agentVersion: device.agentVersion,
+      hasClientTools,
     });
 
     const [session] = await db
@@ -181,6 +213,7 @@ helperRoutes.post(
           osType: device.osType,
           source: 'helper',
           ...(body.helperUser ? { helperUser: body.helperUser } : {}),
+          ...(hasClientTools ? { clientTools } : {}),
         },
       })
       .returning();
@@ -214,7 +247,27 @@ helperRoutes.post(
       return c.json({ error: preflight.error }, preflight.status as 400);
     }
 
-    const { session: dbSession, sanitizedContent, systemPrompt, maxBudgetUsd, allowedTools } = preflight;
+    const { session: dbSession, sanitizedContent, systemPrompt, maxBudgetUsd, allowedTools, clientTools } = preflight;
+
+    // When the session declared client tools, build the generic client-declared
+    // MCP server: each model tool call publishes `client_tool_request` and parks
+    // a resolver until the helper posts to /tool-results. Sessions without
+    // declarations pass no factory and keep the built-in device MCP path.
+    const mcpServerFactory = clientTools.length > 0
+      ? (
+          _getAuth: unknown,
+          _onPreToolUse: unknown,
+          _onPostToolUse: unknown,
+          getSession: () => ActiveSession,
+        ) => ({
+          server: createClientDeclaredMcpServer(clientTools, (toolName, input) => {
+            const session = getSession();
+            const toolUseId = session.toolUseIdQueue.shift() ?? crypto.randomUUID();
+            return requestClientDeclaredTool(session, toolUseId, toolName, input);
+          }),
+          name: CLIENT_DECLARED_MCP_SERVER_NAME,
+        })
+      : undefined;
 
     // Get or create streaming session
     const activeSession = await streamingSessionManager.getOrCreate(
@@ -232,6 +285,7 @@ helperRoutes.post(
       systemPrompt,
       maxBudgetUsd,
       allowedTools,
+      mcpServerFactory as Parameters<typeof streamingSessionManager.getOrCreate>[7],
     );
 
     // Concurrent message guard
@@ -296,6 +350,69 @@ helperRoutes.post(
         activeSession.eventBus.unsubscribe(subscriptionId);
       }
     });
+  },
+);
+
+// ============================================
+// POST /chat/sessions/:id/tool-results — the helper reports a client-declared
+// tool outcome. helperAuth (applied to all routes) + session-owner check pin it
+// to the same device; the bridge resolves the parked SDK tool call.
+// ============================================
+
+helperRoutes.post(
+  '/chat/sessions/:id/tool-results',
+  zValidator('json', z.object({
+    toolUseId: z.string().min(1).max(200),
+    output: z.unknown().optional(),
+    error: z.string().max(10000).optional(),
+  })),
+  async (c) => {
+    const device = c.get('helperDevice');
+    const sessionId = c.req.param('id');
+    const { toolUseId, output, error } = c.req.valid('json');
+
+    // Session-owner check: the session must belong to this device.
+    const [session] = await db
+      .select({ id: aiSessions.id })
+      .from(aiSessions)
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    // Recover the parked call's tool name BEFORE resolving (which drains the
+    // entry), so the persisted transcript row carries it. Generic: this route
+    // has no knowledge of any specific tool.
+    const toolName = peekClientDeclaredToolName(sessionId, toolUseId);
+
+    const outcome = resolveClientDeclaredTool(sessionId, toolUseId, { output, error });
+    if (outcome === 'duplicate') {
+      return c.json({ error: 'Tool result already submitted' }, 409);
+    }
+    if (outcome === 'not_found') {
+      return c.json({ error: 'unknown_tool_request' }, 404);
+    }
+
+    // Persist a tool_result row so reopening the session from History renders
+    // the same cards/citations the live stream did. The SDK's post-tool-use
+    // hook never runs for the bridged client-declared path, so this is the only
+    // place a client tool's output is recorded. Generic: output = whatever the
+    // client posted (its output, or an { error } payload).
+    try {
+      await db.insert(aiMessages).values({
+        sessionId,
+        role: 'tool_result',
+        toolName: toolName ?? null,
+        toolOutput: error !== undefined ? { error } : (output ?? null),
+        toolUseId,
+      });
+    } catch (err) {
+      console.error('[Helper] Failed to persist tool_result message:', err);
+    }
+
+    return c.json({ ok: true });
   },
 );
 
@@ -458,6 +575,7 @@ helperRoutes.get('/chat/sessions/:id/messages', async (c) => {
       role: aiMessages.role,
       content: aiMessages.content,
       toolName: aiMessages.toolName,
+      toolOutput: aiMessages.toolOutput,
       createdAt: aiMessages.createdAt,
     })
     .from(aiMessages)
@@ -490,6 +608,8 @@ helperRoutes.delete('/chat/sessions/:id', async (c) => {
     .set({ status: 'closed', updatedAt: new Date() })
     .where(eq(aiSessions.id, sessionId));
 
+  // Unblock and drain any parked client-declared tool calls before teardown.
+  failPendingClientDeclaredForSession(sessionId);
   streamingSessionManager.remove(sessionId);
 
   return c.json({ success: true });
