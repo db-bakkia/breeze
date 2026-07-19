@@ -116,6 +116,101 @@ body {
   color: var(--text-secondary);
 }
 
+/* ----------------------------------------------------------
+   Shell (one header over a single swapping main region)
+   ---------------------------------------------------------- */
+.helper-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+  min-height: 0;
+  background: var(--ws-canvas);
+}
+
+/* Grid items' min-width:auto would size the column to the header's
+   min-content and force horizontal overflow on narrow windows (down to the
+   360px minimum) — let rows shrink and truncate internally instead. */
+.helper-shell > * {
+  min-width: 0;
+}
+
+/* Nav sits between the title and the drag spacer; must stay clickable. */
+.helper-shell-nav {
+  display: flex;
+  align-items: center;
+  padding-left: 10px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.helper-shell-main {
+  position: relative;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* The active view fills the 1fr row. These roots set height:100% for the
+   standalone/full-window case; in the shell they flex to the region so an
+   error banner above them can coexist without overflow. */
+.helper-shell-main > .helper-container,
+.helper-shell-main > .helper-history {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Wide windows with the chat panel open: main region splits into Files (1fr)
+   plus a fixed-width chat panel. Grid children get min-* so both columns can
+   shrink and scroll internally instead of forcing horizontal overflow. */
+.helper-shell-main-split {
+  display: grid;
+  grid-template-columns: 1fr var(--ws-chat-panel-w, 340px);
+}
+
+.helper-shell-main-split > * {
+  min-width: 0;
+  min-height: 0;
+}
+
+/* An error surfacing while the chat panel rides beside Files spans both grid
+   columns as a top strip rather than getting wedged into a single cell. */
+.helper-shell-main-split > .helper-error-banner {
+  grid-column: 1 / -1;
+}
+
+/* The chat side panel: a raised surface hinged on a subtle left border, sliding
+   in from the right. It's a flex column so ChatView's messages scroll and the
+   composer pins to the bottom, mirroring the full-swap chat. */
+.helper-chat-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--ws-raised);
+  border-left: 1px solid var(--ws-border-subtle);
+  box-shadow: var(--ws-shadow-1);
+  animation: helper-chat-panel-in 160ms var(--ws-ease);
+}
+
+@keyframes helper-chat-panel-in {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* Chat toggle in a "showing the panel" state. */
+.helper-chat-toggle[aria-pressed='true'] {
+  background: var(--ws-raised);
+  border-color: var(--ws-border-subtle);
+  color: var(--ws-ink);
+}
+
 .helper-center p {
   margin: 0;
   font-size: 13px;
@@ -141,6 +236,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .helper-status-dot {
@@ -164,6 +260,9 @@ body {
   color: var(--ws-ink);
   letter-spacing: 0.01em;
   pointer-events: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ----------------------------------------------------------
