@@ -6,20 +6,32 @@ import type { ExtensionJobDefinition } from '@breeze/extension-sdk';
 
 /**
  * Route namespaces already mounted by core (apps/api/src/index.ts, /api/v1/*).
- * An extension may not shadow them. Keep in sync when core adds mounts.
+ * An extension may not shadow them.
  *
- * Regenerate the inner-mount list with:
- *   grep -oE "api\.route\('/[a-z0-9-]+" apps/api/src/index.ts
- * then add the outer-app mounts `oauth`, `settings`, and the shortlink
- * prefix `s`, which are mounted directly on the outer Hono app rather than
- * through the versioned `/api/v1` router. See src/index.test.ts for the
- * hand-maintained ground-truth contract this set is checked against.
+ * This set must stay in sync with the identical set in
+ * `@breeze/extension-sdk` (packages/extension-sdk/src/manifest.ts) — both are
+ * asserted equal by src/index.test.ts.
+ *
+ * There is no manual regeneration step for the common case: src/index.test.ts
+ * derives the core mounts from apps/api/src/index.ts at test time and fails if
+ * a `api.route('/<ns>', …)` or `app.route('/api/v1/<ns>', …)` mount is missing
+ * here.
+ *
+ * Two cases still need a human, because they declare their paths in another
+ * file: `api.route('/', subRouter)` (pinned by a tripwire test that asserts
+ * exactly which sub-routers are root-mounted), and `mountX(app)` helper
+ * mounts (not tripwired; none currently add a `/api/v1` segment). If either
+ * changes, resolve the new paths by hand and reserve them here.
+ *
+ * Entries with no matching mount (e.g. `s`, `oauth`, `settings`, `ext`) are
+ * deliberate extra reservations and are allowed.
  */
 export const RESERVED_ROUTE_NAMESPACES = new Set([
   'access-reviews', 'accounting', 'admin', 'agent-versions', 'agent-ws',
   'agents', 'ai', 'alert-templates', 'alerts', 'analytics', 'api-keys',
   'audit-baselines', 'audit-logs', 'auth', 'authenticator', 'automations',
-  'backup', 'browser-security', 'c2c', 'catalog', 'changes', 'cis',
+  'backup', 'billing', 'browser-security', 'c2c', 'catalog', 'changes',
+  'cis',
   'client-ai', 'config', 'configuration-policies', 'contracts',
   'custom-fields', 'deployments', 'desktop-ws', 'dev', 'device-groups',
   'devices', 'discovery', 'dns-security', 'docs', 'dr', 'enrollment-keys',
@@ -28,14 +40,17 @@ export const RESERVED_ROUTE_NAMESPACES = new Set([
   'incidents', 'installer', 'integrations', 'internal', 'invoices', 'logs',
   'm365', 'maintenance', 'mcp', 'me', 'metrics', 'mobile', 'monitoring',
   'monitors', 'network', 'notifications', 'oauth', 'onedrive', 'orgs',
-  'pam', 'partner', 'partners', 'patch-policies', 'patches', 'pax8',
+  'pam', 'partner', 'partner-api', 'partner-service-principals', 'partners',
+  'patch-policies', 'patches', 'pax8',
   'peripherals', 'permissions', 'playbooks', 'plugins', 'policies',
   'portal', 'psa', 'quotes', 'reliability', 'remediation-suggestions',
   'remote', 'reports', 'roles', 's', 's1', 'script-library', 'scripts',
-  'search', 'security', 'sensitive-data', 'settings', 'snmp', 'software',
-  'software-inventory', 'software-policies', 'sso', 'system',
-  'system-tools', 'tags', 'third-party-catalog', 'ticket-categories',
-  'ticket-config', 'tickets', 'time-entries', 'tunnel-http', 'tunnel-ws',
+  'search', 'security', 'sensitive-data', 'service-principals', 'settings',
+  'snmp', 'software',
+  'software-inventory', 'software-policies', 'sso', 'support',
+  'system', 'system-tools', 'tags', 'third-party-catalog',
+  'ticket-categories', 'ticket-config', 'ticket-forms',
+  'ticket-response-templates', 'tickets', 'time-entries', 'tunnel-http', 'tunnel-ws',
   'tunnels', 'unifi', 'update-rings', 'user-risk', 'users', 'viewers',
   'vnc-exchange', 'vnc-viewer', 'vulnerabilities', 'webhooks',
 ]);
