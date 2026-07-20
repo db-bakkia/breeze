@@ -25,19 +25,33 @@ import { ExtensionIncompatibleError } from './errors';
  *   - `breezeVersion`: this API build's own version (apps/api/package.json),
  *     pinned for the same bundling reason. A manifest's `requires.breeze` range is
  *     satisfied against this.
- *   - `webSdkVersion`: intentionally undefined. The API tier serves no web assets,
- *     so it advertises no web SDK version; a manifest that `requires.webSdk` is
- *     reported incompatible here, which is correct at the API tier (the web host
- *     owns that half of the contract).
+ *   - `webSdkVersion`: the version of `@breeze/extension-web-sdk` this API image
+ *     was built against. This same API process serves the web registry
+ *     (`/api/v1/extensions/registry`) and web assets
+ *     (`/api/v1/extensions/assets/...`) — see Task 3 — and
+ *     `assertCompatible`/`checkExtensionCompatibility` is the ONLY compatibility
+ *     gate that governs activation, web included; there is no separate web-tier
+ *     gate. So the host must advertise the `@breeze/extension-web-sdk` contract
+ *     version it was built against, or every manifest with a `web` section (which
+ *     mandates `requires.webSdk`) is reported incompatible and never activates.
+ *     Pinned as a constant for the same bundling reason as `serverSdkVersion`; kept
+ *     in lockstep with packages/extension-web-sdk/package.json ("version") by
+ *     review.
  *
  * Capability posture: the host advertises the full SUPPORTED_EXTENSION_CAPABILITIES
  * set. Those constants define the PLATFORM contract the manifest schema validates
  * against, so advertising them means "this platform understands these capability
  * tokens", not "the API tier physically serves each one". The API loader wires the
- * server.* contributions; web.* contributions are wired by the web host. Slots are
- * a separate, versioned negotiation the API tier does not participate in, so
- * `slots` is empty and a manifest declaring web slots is reported incompatible
- * until web-host slot wiring lands.
+ * server.* contributions; web.* contributions are wired by the web host.
+ *
+ * Slot contracts: `slots` names the web extension-point contract versions THIS
+ * deployment supports — a separate axis from `webSdkVersion` above (a manifest
+ * can satisfy `requires.webSdk` yet still declare a slot this deployment doesn't
+ * implement). `device.detail.tabs@1` and `organization.settings.sections@1` are the two
+ * contracts the web host currently implements (see plan03-seams.md). A manifest
+ * declaring a slot/version not listed here is reported incompatible by
+ * `checkExtensionCompatibility` (compatibility.ts). Widen this map only when the
+ * web host actually ships support for the new contract version.
  */
 export const HOST_API_VERSION = 'breeze.extensions/v1' as const;
 
@@ -47,13 +61,19 @@ export const HOST_SERVER_SDK_VERSION = '1.0.0';
 /** @see apps/api/package.json "version" */
 export const HOST_BREEZE_VERSION = '0.1.0';
 
+/** @see packages/extension-web-sdk/package.json "version" */
+export const HOST_WEB_SDK_VERSION = '1.0.0';
+
 export const HOST_DESCRIPTOR: ExtensionHostDescriptor = Object.freeze({
   apiVersions: Object.freeze([HOST_API_VERSION]),
   breezeVersion: HOST_BREEZE_VERSION,
   serverSdkVersion: HOST_SERVER_SDK_VERSION,
-  webSdkVersion: undefined,
+  webSdkVersion: HOST_WEB_SDK_VERSION,
   capabilities: Object.freeze([...SUPPORTED_EXTENSION_CAPABILITIES]),
-  slots: Object.freeze({}),
+  slots: Object.freeze({
+    'device.detail.tabs': Object.freeze([1]),
+    'organization.settings.sections': Object.freeze([1]),
+  }),
 });
 
 /**
