@@ -4,6 +4,7 @@ import {
   type PartnerExportBlockedRecord,
   type PartnerExportResource,
 } from './schemas';
+import { shouldRunStructuralLayer } from './exportSafety.classification';
 
 const MAX_FIELD_PATHS = 20;
 const MAX_FIELD_PATH_LENGTH = 256;
@@ -87,32 +88,62 @@ function isForbiddenFieldName(name: string): boolean {
   return splitFieldName(name).some((token) => FORBIDDEN_FIELD_TOKENS.has(token));
 }
 
-function shannonEntropy(value: string): number {
-  const frequencies = new Map<string, number>();
-  for (const character of value) frequencies.set(character, (frequencies.get(character) ?? 0) + 1);
-  let entropy = 0;
-  for (const count of frequencies.values()) {
-    const probability = count / value.length;
-    entropy -= probability * Math.log2(probability);
+const CASE_TRANSITION_MIN = 2;
+const SEGMENT_SECRET_MIN_LENGTH = 16;
+const SEGMENT_SINGLE_CASE_MAX = 18;
+const SEGMENT_MIN_DISTINCT_CHARS = 5;
+const SEGMENT_MIN_VOWEL_RATIO = 0.15;
+const VOWEL_PATTERN = /[aeiouy]/iu;
+
+/** ≥2 upper/lower transitions between adjacent letters ⇒ internally mixed case (not just a leading capital). */
+function hasMixedInternalCase(segment: string): boolean {
+  const letters = [...segment].filter((character) => /[A-Za-z]/u.test(character));
+  if (letters.length < 4) return false;
+  let transitions = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    if ((letters[index - 1]! === letters[index - 1]!.toUpperCase())
+      !== (letters[index]! === letters[index]!.toUpperCase())) transitions += 1;
   }
-  return entropy;
+  return transitions >= CASE_TRANSITION_MIN;
 }
 
-function boundedWindows(value: string, windowSize: number): string[] {
-  if (value.length <= windowSize) return [value];
-  const offsets = [0, Math.floor((value.length - windowSize) / 2), value.length - windowSize];
-  return [...new Set(offsets)].map((offset) => value.slice(offset, offset + windowSize));
+function vowelRatio(segment: string): number {
+  const letters = [...segment].filter((character) => /[A-Za-z]/u.test(character));
+  if (letters.length === 0) return 0;
+  return letters.filter((character) => VOWEL_PATTERN.test(character)).length / letters.length;
 }
 
-function candidateLooksHighEntropy(candidate: string): boolean {
+/** Distinct-character count — a proxy for randomness that a repetitive run (e.g. a zero-entropy `'a'.repeat(64)`) fails. */
+function distinctCharCount(segment: string): number {
+  return new Set(segment).size;
+}
+
+/** A delimiter-free segment that looks like key material rather than a word. */
+function segmentLooksSecretLike(segment: string): boolean {
+  if (segment.length < SEGMENT_SECRET_MIN_LENGTH) return false;
+  if (hasMixedInternalCase(segment)) return true;             // e.g. bPxRfiCYEXAMPLEKEY
+  if (segment.length > SEGMENT_SINGLE_CASE_MAX
+    && distinctCharCount(segment) >= SEGMENT_MIN_DISTINCT_CHARS) return true;   // long single-case blob / hex (but not a zero-entropy run)
+  return vowelRatio(segment) < SEGMENT_MIN_VOWEL_RATIO;        // unpronounceable run
+}
+
+/**
+ * Structural secret heuristic. Splits a candidate on path/slug delimiters
+ * (which are also base64/base64url members — random tokens still leave 32+ char
+ * runs between them, so this does not shred real secrets) and asks whether any
+ * delimiter-free segment looks like key material. Benign identifiers (device
+ * paths, hostnames, package slugs) decompose into short word-like segments;
+ * random secrets do not. Replaces a Shannon-entropy floor that flagged 86% of
+ * ordinary inventory strings.
+ */
+function candidateLooksSecretLike(candidate: string): boolean {
   if (candidate.length < 32 || UUID_PATTERN.test(candidate)) return false;
-  const sampleSize = Math.min(64, candidate.length);
-  return boundedWindows(candidate, sampleSize).some((sample) => shannonEntropy(sample) >= 3.2);
+  return candidate.split(/[/_+=-]+/u).filter(Boolean).some(segmentLooksSecretLike);
 }
 
 function windowContainsHighEntropyToken(window: string): boolean {
   const candidates = window.match(/[A-Za-z0-9+/_=-]{32,}/gu) ?? [];
-  return candidates.some(candidateLooksHighEntropy);
+  return candidates.some(candidateLooksSecretLike);
 }
 
 interface ScriptToken {
@@ -254,10 +285,10 @@ function containsCredentialAssignment(value: string, conservativeIdentifiers: bo
   return inspectCredentialSyntax(value, conservativeIdentifiers).secretLike;
 }
 
-function isSecretLikeValue(value: string, inspectScriptIdentifiers: boolean): boolean {
+function isSecretLikeValue(value: string, inspectScriptIdentifiers: boolean, runStructural: boolean): boolean {
   return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value))
     || containsCredentialAssignment(value, inspectScriptIdentifiers)
-    || windowContainsHighEntropyToken(value);
+    || (runStructural && windowContainsHighEntropyToken(value));
 }
 
 function isSemanticIdentifierPath(path: string): boolean {
@@ -283,7 +314,10 @@ export type DefinitionInspectionResult =
   | { safe: true }
   | { safe: false; reason: 'secret_detected'; fieldPaths: string[] };
 
-export function inspectDefinitionForSecrets(definition: unknown): DefinitionInspectionResult {
+export function inspectDefinitionForSecrets(
+  definition: unknown,
+  resource?: PartnerExportResource,
+): DefinitionInspectionResult {
   const fieldPaths: string[] = [];
   const seenPaths = new Set<string>();
   const ancestors = new Set<object>();
@@ -321,8 +355,9 @@ export function inspectDefinitionForSecrets(definition: unknown): DefinitionInsp
         traversalStopped = true;
         return;
       }
+      const runStructural = resource === undefined || shouldRunStructuralLayer(resource, path);
       if (!(trustedRevision && SHA256_PATTERN.test(value)) && (
-        isSecretLikeValue(value, path.split('.').at(-1)?.toLowerCase() === 'content')
+        isSecretLikeValue(value, path.split('.').at(-1)?.toLowerCase() === 'content', runStructural)
         || (isSemanticIdentifierPath(path) && isSecretSemanticIdentifier(value))
       )) addPath(path);
       return;
@@ -391,7 +426,7 @@ export function safelyExportDefinition<T>(
   identity: PartnerExportBlockedIdentity,
   definition: T,
 ): { safe: true; definition: T } | { safe: false; blocked: PartnerExportBlockedRecord } {
-  const inspection = inspectDefinitionForSecrets(definition);
+  const inspection = inspectDefinitionForSecrets(definition, identity.resource);
   if (inspection.safe) return { safe: true, definition };
   return { safe: false, blocked: buildSafeBlockedRecord(identity, inspection) };
 }
