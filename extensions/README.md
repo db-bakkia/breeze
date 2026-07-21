@@ -50,6 +50,27 @@ ignores extension checkouts, and stock Docker images neither install nor build
 them. A legacy checkout installs and builds inside its own directory with its
 own lockfile.
 
+## SDK dependencies
+
+Core Breeze apps and packages consume the committed extension SDK packages
+under `packages/` through `workspace:*` dependencies. Keep that resolution
+inside the root workspace; do not add checkout-specific package paths or
+overrides to the root manifest or public lockfile.
+
+A legacy extension checkout remains a self-contained project. It declares,
+installs, locks, and builds its own SDK dependencies inside its checkout rather
+than relying on the Breeze root workspace to resolve them.
+
+For local dev environment variables and service overrides an extension
+needs when running against the dev stack (container env, secrets, extra
+mounts), the pattern is an untracked `docker-compose.*.override.yml` layered
+on top of `docker-compose.yml`, plus a gitignored `.env.*` file loaded via
+that override's `env_file:` key. Commit only a `.env.*.example` template
+with placeholder values — never a real secret, and never a real secret's
+value in the override YAML itself, even though the YAML file stays
+untracked (untracked files still sit in plaintext on disk and are easy to
+`git add -A` by accident).
+
 ## Seam v2: manifest flags and ExtensionContext
 
 ### `agentRoutes` manifest flag
