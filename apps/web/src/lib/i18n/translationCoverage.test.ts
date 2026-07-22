@@ -26,7 +26,9 @@ const namespaceDuplicateBaselines = {
     // pt-BR (same cognate already accepted for document.totals.subtotal).
     'billing.json': 47,
     // +1: richTextEditor.link — "Link" is the standard loanword in pt-BR.
-    'common.json': 90,
+    // +3: dashboard.vuln.kevCves — "{{count}} CVE(s)" is a locale-invariant
+    // acronym (base/_one/_other).
+    'common.json': 93,
     'devices.json': 159,
     'discovery.json': 17,
     'integrations.json': 23,
@@ -56,7 +58,9 @@ const namespaceDuplicateBaselines = {
     // +1: liveTotals "Total" — spells identically to English in es-419 (same
     // cognate already accepted for document.totals.firstPeriodTotal's root word).
     'billing.json': 39,
-    'common.json': 75,
+    // +1: dashboard.vuln.kevCves_one — "{{count}} CVE" is a locale-invariant
+    // acronym.
+    'common.json': 76,
     'devices.json': 115,
     'discovery.json': 17,
     'integrations.json': 31,
@@ -90,7 +94,9 @@ const namespaceDuplicateBaselines = {
     // +1: liveTotals "Total" — spells identically to English in fr-FR (same
     // cognate already accepted for document.totals.firstPeriodTotal's root word).
     'billing.json': 50,
-    'common.json': 93,
+    // +1: dashboard.vuln.kevCves_one — "{{count}} CVE" is a locale-invariant
+    // acronym.
+    'common.json': 94,
     'devices.json': 136,
     'discovery.json': 15,
     'integrations.json': 38,
@@ -119,7 +125,9 @@ const namespaceDuplicateBaselines = {
     // placeholder are locale-invariant.
     'billing.json': 35,
     // +1: richTextEditor.link — "Link" is the standard loanword in de-DE.
-    'common.json': 91,
+    // +3: dashboard.vuln.kevCves — "{{count}} CVE(s)" is a locale-invariant
+    // acronym (base/_one/_other).
+    'common.json': 94,
     'devices.json': 146,
     'discovery.json': 26,
     'integrations.json': 43,
