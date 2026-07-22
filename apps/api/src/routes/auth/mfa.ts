@@ -46,7 +46,8 @@ import {
   requireCurrentPasswordStepUp,
   enforceExistingFactorStepUp,
   parsePendingMfa,
-  evaluatePendingMfa
+  evaluatePendingMfa,
+  mintLoginRegisterGrant
 } from './helpers';
 
 const { db, withSystemDbAccessContext, runOutsideDbContext } = dbModule;
@@ -361,6 +362,10 @@ mfaRoutes.post('/mfa/verify', zValidator('json', mfaVerifySchema), async (c) => 
 
     const requiresSetup = userRequiresSetup(user);
 
+    // #2707: mobile-only best-effort mint of a register_approver_device
+    // grant — same rationale as the /auth/login no-MFA success response.
+    const authenticatorRegisterGrantId = await mintLoginRegisterGrant(c, user.id, mfaFamilyId);
+
     return c.json({
       user: {
         id: user.id,
@@ -375,7 +380,8 @@ mfaRoutes.post('/mfa/verify', zValidator('json', mfaVerifySchema), async (c) => 
       },
       tokens: toPublicTokens(tokens),
       mfaRequired: false,
-      requiresSetup
+      requiresSetup,
+      ...(authenticatorRegisterGrantId ? { authenticatorRegisterGrantId } : {})
     });
   }
 
@@ -712,8 +718,9 @@ mfaRoutes.post('/mfa/enable', authMiddleware, zValidator('json', mfaEnableWithPa
 
 // SR2-20: existing-factor step-up. Proves an EXISTING MFA factor (TOTP, SMS,
 // or passkey — a discriminated union on `method` so a passkey-only user is
-// never locked out) and mints a short-lived single-use grant, which the
-// caller then presents as `stepUpGrantId` to a factor-ADDITION endpoint
+// never locked out) and mints a short-lived single-use grant scoped to the
+// requested operation (defaulting to add_factor; #2707 adds register_approver_device),
+// which the caller then presents as `stepUpGrantId` to a factor-ADDITION endpoint
 // (`/mfa/enable`, setup-confirm, `/mfa/sms/enable`, `/passkeys/register/*`)
 // on an already-protected account. The passkey branch expects the client to
 // have already called `POST /auth/mfa/step-up/options` (passkeys.ts) to get
@@ -795,7 +802,7 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
   }
   const grantId = await mintStepUpGrant({
     userId: auth.user.id,
-    operation: 'add_factor',
+    operation: body.operation,
     authEpoch: epochs.authEpoch,
     mfaEpoch: epochs.mfaEpoch,
     sid: auth.token.sid
@@ -810,7 +817,7 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
     result: 'success',
     userId: auth.user.id,
     email: auth.user.email,
-    details: { method: body.method, operation: 'add_factor' }
+    details: { method: body.method, operation: body.operation }
   });
 
   return c.json({ stepUpGrantId: grantId });

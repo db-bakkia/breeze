@@ -1398,7 +1398,21 @@
     "registering": "Registrándose…",
     "registerThisDevice": "Registre este dispositivo",
     "revoking": "Revocando…",
-    "revokeDevice": "Revocar dispositivo"
+    "revokeDevice": "Revocar dispositivo",
+    "incorrectCode": "Código incorrecto.",
+    "incorrectPassword": "Contraseña incorrecta.",
+    "passkeyVerificationFailed": "Verificación con clave de acceso fallida: vuelva a intentarlo.",
+    "tooManyAttemptsTryAgainInAFewMinutes": "Demasiados intentos: vuelva a intentarlo en unos minutos.",
+    "verificationExpiredPleaseVerifyAgain": "La verificación expiró: vuelva a verificar.",
+    "useYourPasskeyOrAuthenticatorCodeInstead": "Use su clave de acceso o código del autenticador en su lugar: recargue la página para actualizar sus opciones.",
+    "pendingActivatesOnFirstApproval": "Pendiente: se activa con la primera aprobación",
+    "sessionExpiredReloadAndTryAgain": "La sesión expiró: recargue la página y vuelva a intentarlo.",
+    "registrationCancelled": "Se canceló el registro."
+  },
+  "stepUpPrompt": {
+    "youWillConfirmWithYourPasskey": "Confirmará con su clave de acceso (Touch ID/Windows Hello) al registrarse.",
+    "authenticatorCode": "Código del autenticador",
+    "confirmYourPassword": "Confirme su contraseña"
   },
   "cannedResponsesCard": {
     "cannedResponses": "Respuestas enlatadas",
